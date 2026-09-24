@@ -1,5 +1,7 @@
 # Grove
 
+<img src="design/grove-icon.svg" width="96" alt="Grove icon" />
+
 A read-only macOS desktop viewer of git working-tree changes across the repositories you
 register. It never stages, commits, pushes, pulls, edits files, or opens a network
 connection, and it never browses commit history: every reading is the worktree against
