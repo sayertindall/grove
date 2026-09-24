@@ -1,10 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Grove reads registered repositories, lists projects, reads one diff, picks a directory, and listens for the watcher event.",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "dialog:allow-open",
+    "store:default"
   ]
 }

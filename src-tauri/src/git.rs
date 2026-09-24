@@ -570,7 +570,15 @@ mod tests {
         let status = read_project_status(&fixture.canonical());
 
         assert_eq!(status.state, ProjectState::Clean);
-        assert_eq!(status.display_name, fixture.root.file_name().unwrap().to_string_lossy());
+        assert_eq!(
+            status.display_name,
+            fixture
+                .root
+                .file_name()
+                .expect("fixture directory name")
+                .to_string_lossy()
+                .to_string()
+        );
         assert_eq!(status.staged_count, 0);
         assert_eq!(status.unstaged_count, 0);
         assert_eq!(status.untracked_count, 0);
