@@ -1,0 +1,83 @@
+name: release
+
+# Tag a version to publish a release, or start a run from the Actions tab to get the
+# bundles as run artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: Create the GitHub release as a draft
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "app-v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-macos:
+    name: grove ${{ matrix.target }}
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin # Apple silicon
+          - x86_64-apple-darwin # Intel
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - name: install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: test the read paths
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: build the bundles and publish the release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: "Grove v__VERSION__"
+          releaseBody: |
+            Read-only viewer of git working-tree changes across the repositories you register.
+
+            macOS bundles are unsigned, so the first launch of a downloaded copy needs
+            right-click → Open.
+          releaseDraft: ${{ inputs.draft || false }}
+          prerelease: false
+          args: --target ${{ matrix.target }}
+
+      - name: upload the bundles as run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grove-${{ matrix.target }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+          if-no-files-found: error

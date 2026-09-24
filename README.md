@@ -6,6 +6,13 @@ connection, and it never browses commit history: every reading is the worktree a
 `HEAD`. The name is the model: a grove is many trees, and each registered repository is
 one tree shown beside the others.
 
+## Screenshot
+
+![Grove](docs/grove-screenshot.png)
+
+Eleven registered repositories, `dsg-clusters` selected, 26 changed files against `HEAD`,
+dark theme. The diff pane holds the selected file's `CodeView`.
+
 ## Stack
 
 | Library | Role |
@@ -37,6 +44,27 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
 GROVE_LARGE_REPO=/path/to/a/big/repo \
   cargo test --manifest-path src-tauri/Cargo.toml -- --ignored --nocapture   # warm read < 500 ms
 ```
+
+## Release
+
+`.github/workflows/release.yml` builds the bundles and attaches them. Tag a version, or
+start a run from the Actions tab (which defaults to a draft release):
+
+```bash
+git tag app-v0.1.0 && git push origin app-v0.1.0
+```
+
+The workflow runs the Rust tests, builds `--target aarch64-apple-darwin` and
+`--target x86_64-apple-darwin` on `macos-latest`, uploads the `.dmg` and `.app` as run
+artifacts, and creates a GitHub release with the bundles attached (`tauri-action`
+replaces `__VERSION__` from `tauri.conf.json`).
+
+Grove is not signed or notarized, so macOS quarantines the first launch of a downloaded
+bundle: right-click the app and choose Open, or
+`xattr -dr com.apple.quarantine /Applications/Grove.app`. To sign and notarize in CI, add
+`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`,
+`APPLE_PASSWORD` and `APPLE_TEAM_ID` as repository secrets; `tauri build` reads them from
+the environment.
 
 ## Layout
 
