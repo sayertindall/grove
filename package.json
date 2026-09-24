@@ -1,12 +1,13 @@
 {
   "name": "grove",
+  "version": "0.1.1",
   "private": true,
-  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "icon": "tauri icon design/grove-icon.svg",
     "tauri": "tauri"
   },
   "dependencies": {

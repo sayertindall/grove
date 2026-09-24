@@ -46,6 +46,19 @@ GROVE_LARGE_REPO=/path/to/a/big/repo \
   cargo test --manifest-path src-tauri/Cargo.toml -- --ignored --nocapture   # warm read < 500 ms
 ```
 
+## Icon
+
+`design/grove-icon.svg` is the source art: a 1024 canvas holding the macOS tile (824 px,
+inset 100 px, continuous-corner squircle sampled from a superellipse rather than drawn with
+arcs), three firs, the tallest in the same emerald the UI uses for additions. `pnpm icon`
+regenerates `src-tauri/icons` from it, including the `.icns` layer set the bundle wants.
+
+The CLI also emits iOS, Android, and Microsoft Store variants; a macOS-only bundle
+references none of them, so those files are deleted after each run.
+
+macOS 26 Liquid Glass icons need an Icon Composer `.icon` file inside an Xcode project.
+A Tauri bundle ships a static `.icns`, so Grove keeps the classic icon.
+
 ## Release
 
 `.github/workflows/release.yml` builds the bundles and attaches them. Tag a version, or
