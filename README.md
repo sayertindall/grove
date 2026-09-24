@@ -10,8 +10,9 @@ one tree shown beside the others.
 
 ![Grove](docs/grove-screenshot.png)
 
-Eleven registered repositories, `dsg-clusters` selected, 26 changed files against `HEAD`,
-dark theme. The diff pane holds the selected file's `CodeView`.
+Eleven registered repositories, `dsg-clusters` selected, with
+`checks/tests/test_reference_composition.py` open: two hunks against `HEAD`, `-2 +409`,
+the unchanged runs collapsed, and word-level highlighting inside the changed lines.
 
 ## Stack
 
