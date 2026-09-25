@@ -2,15 +2,15 @@
 
 ## Project Overview
 
-Grove is a read-only macOS desktop viewer of working-tree changes across explicitly registered Git repositories. Compare worktrees against `HEAD`, never commit history. Production code must not stage, commit, push, pull, edit repository files, or open network connections. Removing a project only unregisters its path. App-data persistence is limited to the project list.
+Grove is a read-only macOS desktop viewer of working-tree changes across explicitly registered Git repositories. Compare worktrees against `HEAD` (or, for a partially staged file, the index against `HEAD` and the worktree against the index), never commit history. Production code must not stage, commit, push, pull, edit repository files, or open network connections. Removing a project only unregisters its path. App-data persistence is the project list (store plugin), window geometry (window-state plugin), and UI preferences in `localStorage` (`grove.*` keys).
 
 ## Architecture & Data Flow
 
-- React → typed invokes in `src/api/grove.ts` → thin Tauri commands → Rust discovery, Git reads, and config functions. Keep Git/filesystem knowledge out of the webview. The IPC surface is four commands (`scan_for_repos`, `list_projects`, `set_projects`, `get_diff`) and one event (`grove://projects-changed`).
-- `src-tauri/src/commands.rs` routes whole-list replacement through `replace_registered_projects`: canonicalize/dedupe paths, save and flush, then rebuild watchers. Startup uses the same writer. Save failure must leave the watcher unchanged; rebuild failure can occur after persistence.
-- `src-tauri/src/watch.rs` owns the only long-lived backend state, a Tauri-managed `Mutex<ProjectWatcher>`. Watch project roots recursively, including worktree and `.git` changes; debounce for 300ms. Match events to the longest project-path prefix at path-component boundaries, dedupe, and emit in stored order.
-- TanStack Query is the only server-state cache: `['projects']` and `['diff', canonicalPath]`, with `staleTime: Infinity` and retries disabled. Watch events invalidate projects and affected diffs; successful list replacement invalidates all diffs. No polling or focus-based refresh mechanism.
-- `App` composes `ProjectSidebar`, `ChangesTree`, and `DiffViewer`. Props down, callbacks up; selection and theme stay in local React state. Providers are composed in `src/main.tsx`; Rust dependencies enter through `AppHandle`, managed state, and ordinary function arguments, not a DI framework.
+- React → typed invokes in `src/api/grove.ts` (rejections normalized to `Error`) → thin Tauri commands → Rust discovery, Git reads, and config functions. Keep Git/filesystem knowledge out of the webview. Commands: `scan_for_repos`, `list_projects`, `get_project_status`, `set_projects`, `list_changes` (summaries only, no contents), `get_file_diff` (one file, one view), `reveal_in_finder`, `open_path` (both reject paths outside registered projects). One event: `grove://projects-changed`.
+- `src-tauri/src/commands.rs` routes whole-list replacement through `replace_registered_projects`: canonicalize/dedupe paths, save and flush, then rebuild watchers. Startup uses the same writer. `list_projects` reads projects in parallel and returns stored order.
+- `src-tauri/src/watch.rs` owns the only long-lived backend state, a Tauri-managed `Mutex<ProjectWatcher>`: the `NoCache` debouncer (300 ms), the set of armed roots (reported as `ProjectStatus.watching`), and a thread that re-arms missing roots every 5 s. Events for gitignored paths and `.git/` internals other than `index`, `HEAD`, `packed-refs`, and `refs/` are dropped before a project is matched.
+- TanStack Query is the only server-state cache: `['projects']`, `['changes', path, ignoreWhitespace]`, `['fileDiff', path, file, view, ignoreWhitespace]`, retries disabled. A watch event patches the named rows via `get_project_status` and invalidates only those projects' changes and file diffs; ⌘R invalidates everything.
+- `App` composes `ProjectSidebar`, `ChangesTree`, `DiffViewer`, and `MissingProject`. Props down, callbacks up; selection, theme, sort, filters, and pane widths persist through `src/lib/storage.ts`.
 
 ## Key Directories
 
@@ -46,7 +46,7 @@ There is no `pnpm test` or `pnpm lint` script, frontend test runner, or configur
 - Keep Rust commands thin and Git work split into pure functions. The spec limits Rust functions to 40 lines and three conditional/early-exit/filter branches; flat exhaustive enum maps are exempt. No registries, trait-object plugins, or additional state machines.
 - Return `Result<T, String>` from commands, with underlying error text and known path context. Missing/unreadable projects remain sidebar rows; diff failures are errors. Render errors inline, not in modals. Log nonfatal watcher/read errors; recover poisoned watcher locks with `into_inner`. Do not add production `unwrap`/`expect`; the existing startup `.expect` in `lib.rs` is spec drift, not a pattern to copy.
 - Keep async invokes in the API layer and mutations in callbacks. Clean up event subscriptions even if their promises resolve after unmount, following `App`'s cancellation/unlisten pattern.
-- Reuse `cn`, class-variance-authority variants, and CSS tokens in `src/index.css`. Keep one `useFileTree` model and update it with `resetPaths`/`setGitStatus`. Memoize diff metadata; bump `CodeView` item versions when content or display options change. Highlight through the existing worker pool, not the render thread. Never enable diff editing.
+- Reuse `cn`, class-variance-authority variants, and CSS tokens in `src/index.css`. Keep one `useFileTree` model and update it with `resetPaths`/`setGitStatus`. Memoize diff metadata; bump the `CodeView` item version only when the diff content changes, so a background refresh keeps the scroll position. The `CodeView` root is its scroll container and must keep `overflow-auto`. Highlight through the existing worker pool. Never enable diff editing.
 - Preserve Git edge semantics: combined worktree-vs-`HEAD` diffs, separate staged membership, ignored paths omitted, no recursive submodule content reads, and empty-tree comparison for unborn `HEAD`. Check each content side's 512 KiB cap before allocation. Binary/omitted sides use patch rendering; absent add/delete sides are not truncation.
 
 ## Important Files
@@ -55,7 +55,7 @@ There is no `pnpm test` or `pnpm lint` script, frontend test runner, or configur
 - `src/main.tsx`, `src/App.tsx`, `src/queries.ts`, `src/diffsWorker.ts`: composition, selection, invalidation, highlighting lifecycle.
 - `package.json`, `pnpm-lock.yaml`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`: dependencies and build contracts.
 - `vite.config.ts`, `tsconfig.json`: alias alignment, strict TypeScript, fixed dev port; `src-tauri/tauri.conf.json`: desktop build hooks/window; `src-tauri/capabilities/default.json`: permissions; `components.json`: UI registry configuration.
-- For detailed product contracts or edge cases, consult the supplied specification at `/Users/sayertindall/.omp/agent/sessions/-Dev/2026-09-24T18-17-03-572Z_01a0d4a2-a354-7000-ad64-e40cc2cb642f/local/grove-spec-final.md`. This is external session evidence, not a portable repository file; retain its original name. `README.md` is still template documentation. Current styles live in `src/index.css`, not the spec's proposed `src/App.css`.
+- For detailed product contracts or edge cases, consult the supplied specification at `/Users/sayertindall/.omp/agent/sessions/-Dev/2026-09-24T18-17-03-572Z_01a0d4a2-a354-7000-ad64-e40cc2cb642f/local/grove-spec-final.md`. This is external session evidence, not a portable repository file; retain its original name. The app has since grown past it (views, whitespace, images, path actions). Current styles live in `src/index.css`.
 
 ## Runtime/Tooling Preferences
 

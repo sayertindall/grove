@@ -17,12 +17,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(Mutex::new(ProjectWatcher::default()))
         .invoke_handler(tauri::generate_handler![
             commands::scan_for_repos,
             commands::list_projects,
+            commands::get_project_status,
             commands::set_projects,
-            commands::get_diff,
+            commands::list_changes,
+            commands::get_file_diff,
+            commands::reveal_in_finder,
+            commands::open_path,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

@@ -20,14 +20,15 @@ the unchanged runs collapsed, and word-level highlighting inside the changed lin
 
 | Library | Role |
 | --- | --- |
-| Tauri 2 | Desktop shell. Four Rust commands and one event cross to the webview. |
-| git2 | Opens a repository and reads status plus diff. The only git implementation. |
-| notify-debouncer-full 0.7 | Recursive watches on registered roots, 300 ms debounce, then one event. |
+| Tauri 2 | Desktop shell. Eight Rust commands and one event cross to the webview. |
+| git2 | Opens a repository and reads status, branch, and diffs. The only git implementation. |
+| notify-debouncer-full 0.7 | Recursive watches on registered roots, filtered by `.gitignore`, 300 ms debounce. |
+| tauri-plugin-window-state | Restores the window's size and position. |
 | tauri-plugin-store | Persists the project path list in the app data directory. |
 | tauri-plugin-dialog | Directory picker, invoked from JavaScript only. |
 | React 19 + TypeScript + Vite | UI, `strict` TypeScript. |
 | Tailwind CSS 4 + coss ui | The component library. Components are vendored into `src/components/ui`. |
-| TanStack Query 5 | Server state for the project list and the open diff. |
+| TanStack Query 5 | Server state: the project list, one project's change list, and one file's diff. |
 | @pierre/diffs 1.4.3 | `CodeView` renders the selected file; Shiki highlighting runs in a worker pool. |
 | @pierre/trees 1.0.0-beta.6 | `FileTree` renders the changed files with built-in git status. |
 
@@ -84,12 +85,12 @@ the environment.
 
 ## Layout
 
-- `src-tauri/src/config.rs` persists the path list. `git.rs` reads one repository.
-  `discovery.rs` finds repositories. `watch.rs` watches and emits. `commands.rs` adapts
-  IPC. `lib.rs` builds the process.
-- `src/App.tsx` holds selection and theme. `src/queries.ts` owns the two query keys.
-  `src/api/grove.ts` wraps the commands. `src/components/{ProjectSidebar,ChangesTree,DiffViewer}.tsx`
-  each own one pane.
+- `src-tauri/src/config.rs` persists the path list. `git.rs` reads status, branch, change
+  lists, and single-file diffs. `discovery.rs` finds repositories. `watch.rs` watches,
+  filters, re-arms, and emits. `commands.rs` adapts IPC. `lib.rs` builds the process.
+- `src/App.tsx` holds selection and preferences. `src/queries.ts` owns the query keys and
+  the watch-event patching. `src/api/grove.ts` wraps the commands. `src/components/`
+  holds one component per pane plus `MissingProject`, `ImageDiff`, and `Splitter`.
 
 ## Notes
 
@@ -104,3 +105,19 @@ the environment.
 - A pane with no content is not shown: with no projects registered, or with a clean
   selected project, the window shows one empty state instead of an empty tree beside an
   empty diff.
+- **Reads are sized to the view.** The sidebar list reads every project in parallel; a
+  watch event re-reads only the projects it names. A project's change list carries paths,
+  status, and line counts; the two content sides load for the selected file only.
+- **Views.** A partially staged file offers Head, Staged, and Unstaged views. "Hide
+  whitespace" re-reads with whitespace ignored, and files left with no change drop out.
+
+## Shortcuts
+
+| Keys | Action |
+| --- | --- |
+| ⌘R | Re-read everything |
+| ⌘1–⌘9 | Select the Nth visible project |
+| ⌘F | Search the changed files |
+| ⌘O | Add projects |
+| ↑ ↓ | Move through projects (list focused) or files (tree focused) |
+| Esc | Clear the file selection |

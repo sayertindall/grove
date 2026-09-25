@@ -9,17 +9,28 @@ use std::time::Duration;
 
 use git2::{IndexAddOption, Repository, Signature};
 use grove_lib::commands::{
-    get_diff, read_registered_projects, replace_registered_projects, scan_for_repos,
+    ensure_registered_project_path, list_changes, open_path, read_registered_projects,
+    replace_registered_projects, reveal_in_finder, scan_for_repos,
 };
 use grove_lib::discovery::find_repositories;
-use grove_lib::git::{FileChangeStatus, ProjectState};
+use grove_lib::git::{DiffView, FileChangeStatus, ProjectState};
 use grove_lib::watch::{
-    rebuild_project_watchers, ProjectsChanged, ProjectWatcher, PROJECTS_CHANGED_EVENT,
+    rebuild_project_watchers, watching_paths, ProjectWatcher, ProjectsChanged,
+    PROJECTS_CHANGED_EVENT,
 };
 use tauri::test::{mock_builder, mock_context, noop_assets, MockRuntime};
 use tauri::{App, Listener};
 
 static FIXTURE_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Every mock app shares one app-data store file, so tests that write it take turns.
+static STORE_WRITERS: Mutex<()> = Mutex::new(());
+
+fn exclusive_store() -> std::sync::MutexGuard<'static, ()> {
+    STORE_WRITERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct Fixture {
     root: PathBuf,
@@ -29,7 +40,10 @@ impl Fixture {
     /// A temp parent with `clean/`, `dirty/`, and `renamed/` repositories.
     fn new(name: &str) -> Fixture {
         let unique = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("grove-smoke-{}-{unique}-{name}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "grove-smoke-{}-{unique}-{name}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("fixture root");
         let fixture = Fixture { root };
@@ -127,13 +141,15 @@ fn ready<T>(work: impl Future<Output = T>) -> T {
 
 #[test]
 fn registered_projects_report_sidebar_counts() {
+    let _store = exclusive_store();
     let fixture = Fixture::new("registered");
     let paths = fixture.project_paths();
 
     let app = test_app();
     let watcher = Mutex::new(ProjectWatcher::default());
     replace_registered_projects(app.handle(), paths.clone(), &watcher).expect("set projects");
-    let rows = read_registered_projects(app.handle()).expect("list projects");
+    let watching = watching_paths(&watcher);
+    let rows = read_registered_projects(app.handle(), &watching).expect("list projects");
 
     assert_eq!(rows.len(), 3);
     assert_eq!(
@@ -141,39 +157,78 @@ fn registered_projects_report_sidebar_counts() {
         paths
     );
 
-    let clean = rows.iter().find(|row| row.display_name == "clean").expect("clean row");
+    let clean = rows
+        .iter()
+        .find(|row| row.display_name == "clean")
+        .expect("clean row");
     assert_eq!(clean.state, ProjectState::Clean);
-    assert_eq!((clean.staged_count, clean.unstaged_count, clean.untracked_count), (0, 0, 0));
+    assert_eq!(
+        (
+            clean.staged_count,
+            clean.unstaged_count,
+            clean.untracked_count
+        ),
+        (0, 0, 0)
+    );
     assert_eq!((clean.additions, clean.deletions), (0, 0));
+    assert!(clean.watching);
+    assert!(clean.branch.is_some());
+    assert!(clean.reason.is_none());
 
-    let dirty = rows.iter().find(|row| row.display_name == "dirty").expect("dirty row");
+    let dirty = rows
+        .iter()
+        .find(|row| row.display_name == "dirty")
+        .expect("dirty row");
     assert_eq!(dirty.state, ProjectState::Dirty);
     assert_eq!(
-        (dirty.staged_count, dirty.unstaged_count, dirty.untracked_count),
+        (
+            dirty.staged_count,
+            dirty.unstaged_count,
+            dirty.untracked_count
+        ),
         (0, 1, 1)
     );
     assert_eq!((dirty.additions, dirty.deletions), (2, 0));
 
-    let renamed = rows.iter().find(|row| row.display_name == "renamed").expect("renamed row");
+    let renamed = rows
+        .iter()
+        .find(|row| row.display_name == "renamed")
+        .expect("renamed row");
     assert_eq!(renamed.state, ProjectState::Dirty);
 
-    let diff = ready(get_diff(dirty.path.clone())).expect("dirty diff");
-    assert_eq!(diff.path, dirty.path);
-    assert_eq!(diff.files.len(), 2);
+    let changes = ready(list_changes(dirty.path.clone(), false)).expect("dirty changes");
+    assert_eq!(changes.path, dirty.path);
+    assert_eq!(changes.files.len(), 2);
 
-    let renamed_diff = ready(get_diff(renamed.path.clone())).expect("renamed diff");
-    assert_eq!(renamed_diff.files.len(), 1);
-    let rename = &renamed_diff.files[0];
+    let renamed_changes =
+        ready(list_changes(renamed.path.clone(), false)).expect("renamed changes");
+    assert_eq!(renamed_changes.files.len(), 1);
+    let rename = &renamed_changes.files[0];
     assert_eq!(rename.status, FileChangeStatus::Renamed);
     assert_eq!(rename.path, "new.txt");
     assert_eq!(rename.old_path.as_deref(), Some("old.txt"));
     assert!(rename.staged);
 
+    let renamed_diff = ready(grove_lib::commands::get_file_diff(
+        renamed.path.clone(),
+        "new.txt".to_string(),
+        DiffView::Staged,
+        false,
+    ))
+    .expect("renamed file diff");
+    assert_eq!(renamed_diff.status, FileChangeStatus::Renamed);
+    assert_eq!(renamed_diff.old_path.as_deref(), Some("old.txt"));
+    assert_eq!(renamed_diff.view, DiffView::Staged);
+
     // The store survives a restart: a second app reads the same three paths in order.
     let restarted = test_app();
-    let reloaded = read_registered_projects(restarted.handle()).expect("list projects after reload");
+    let reloaded = read_registered_projects(restarted.handle(), &watching)
+        .expect("list projects after reload");
     assert_eq!(
-        reloaded.iter().map(|row| row.path.clone()).collect::<Vec<_>>(),
+        reloaded
+            .iter()
+            .map(|row| row.path.clone())
+            .collect::<Vec<_>>(),
         paths
     );
 }
@@ -185,7 +240,10 @@ fn scan_for_repos_lists_fixture_roots_only() {
 
     let found = ready(scan_for_repos(parent.clone())).expect("scan");
     assert_eq!(found, fixture.project_paths());
-    assert_eq!(find_repositories(Path::new(&parent), 6).expect("scan"), found);
+    assert_eq!(
+        find_repositories(Path::new(&parent), 6).expect("scan"),
+        found
+    );
 
     // A repository is listed at whatever depth it sits at, including depth 0, and the
     // walk never descends into one it already listed.
@@ -210,12 +268,11 @@ fn project_watcher_emits_after_workdir_edit() {
     let app = test_app();
     let (sender, receiver) = mpsc::channel::<Vec<String>>();
 
-    app.handle()
-        .listen(PROJECTS_CHANGED_EVENT, move |event| {
-            if let Ok(payload) = serde_json::from_str::<ProjectsChanged>(event.payload()) {
-                let _ = sender.send(payload.paths);
-            }
-        });
+    app.handle().listen(PROJECTS_CHANGED_EVENT, move |event| {
+        if let Ok(payload) = serde_json::from_str::<ProjectsChanged>(event.payload()) {
+            let _ = sender.send(payload.paths);
+        }
+    });
 
     let watcher = Mutex::new(ProjectWatcher::default());
     rebuild_project_watchers(app.handle(), &watcher, std::slice::from_ref(&dirty))
@@ -227,4 +284,41 @@ fn project_watcher_emits_after_workdir_edit() {
         .recv_timeout(Duration::from_secs(1))
         .expect("an event within a second of the edit");
     assert_eq!(changed, vec![dirty]);
+}
+
+#[test]
+fn path_guard_rejects_paths_outside_registered_projects() {
+    let _store = exclusive_store();
+    let fixture = Fixture::new("guard");
+    let app = test_app();
+    let watcher = Mutex::new(ProjectWatcher::default());
+    replace_registered_projects(app.handle(), fixture.project_paths(), &watcher)
+        .expect("set projects");
+
+    let outside = fixture.path("dirty-extra");
+    std::fs::create_dir_all(&outside).expect("sibling directory");
+    let outside = std::fs::canonicalize(&outside)
+        .expect("canonical sibling")
+        .to_string_lossy()
+        .into_owned();
+
+    let revealed = ready(reveal_in_finder(app.handle().clone(), outside.clone()));
+    assert!(
+        revealed
+            .as_ref()
+            .is_err_and(|error| error.contains("not inside a registered project")),
+        "{revealed:?}"
+    );
+    let opened = ready(open_path(app.handle().clone(), outside));
+    assert!(
+        opened
+            .as_ref()
+            .is_err_and(|error| error.contains("not inside a registered project")),
+        "{opened:?}"
+    );
+
+    let inside = fixture.canonical("dirty/tracked.txt");
+    assert!(ensure_registered_project_path(app.handle(), &inside).is_ok());
+    let parent = fixture.canonical("");
+    assert!(ensure_registered_project_path(app.handle(), &parent).is_err());
 }

@@ -14,7 +14,8 @@ pub fn directory_holds_git_metadata(directory: &Path) -> bool {
 /// Returns the canonical absolute paths of every directory at or below `root`
 /// that directly contains git metadata, sorted lexicographically.
 pub fn find_repositories(root: &Path, max_depth: u32) -> Result<Vec<String>, String> {
-    let metadata = std::fs::metadata(root).map_err(|error| format!("{}: {error}", root.display()))?;
+    let metadata =
+        std::fs::metadata(root).map_err(|error| format!("{}: {error}", root.display()))?;
     if !metadata.is_dir() {
         return Err(format!("{}: not a directory", root.display()));
     }
