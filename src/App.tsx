@@ -1,9 +1,10 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { FolderIcon } from "lucide-react";
+import { FolderIcon, MessageSquareText } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { listenForProjectsChanged, setProjects, toError } from "@/api/grove";
 import { ChangesTree } from "@/components/ChangesTree";
+import ChatPanel from "@/components/ChatPanel";
 import { DiffViewer } from "@/components/DiffViewer";
 import { MissingProject } from "@/components/MissingProject";
 import { ProjectSidebar } from "@/components/ProjectSidebar";
@@ -26,6 +27,7 @@ import {
   segmentedControlRootClassName,
 } from "@/lib/segmented-control";
 import {
+  CHAT_WIDTH,
   SIDEBAR_WIDTH,
   TREE_WIDTH,
   clamp,
@@ -54,7 +56,7 @@ import {
   useFileDiff,
   useProjects,
 } from "@/queries";
-import type { DiffView, ProjectStatus } from "@/types/grove";
+import type { ChatCitation, DiffView, ProjectStatus } from "@/types/grove";
 
 const THEMES = ["system", "dark", "light"] as const;
 const DIFF_STYLES = ["unified", "split"] as const;
@@ -96,19 +98,26 @@ export default function App() {
   const [treeWidth, setTreeWidth] = useState(() =>
     readClampedNumber(storageKeys.treeWidth, TREE_WIDTH.fallback, TREE_WIDTH.min, TREE_WIDTH.max),
   );
+  const [chatOpen, setChatOpen] = useState(() => readBoolean(storageKeys.chatOpen, false));
+  const [chatWidth, setChatWidth] = useState(() =>
+    readClampedNumber(storageKeys.chatWidth, CHAT_WIDTH.fallback, CHAT_WIDTH.min, CHAT_WIDTH.max),
+  );
   const [view, setView] = useState<DiffView>("head");
   const [addRequest, setAddRequest] = useState(0);
   const [replaceError, setReplaceError] = useState<string | null>(null);
 
   const searchRef = useRef<(() => void) | null>(null);
   const pendingPathRef = useRef<string | null>(null);
+  const pendingFileRef = useRef<string | null>(null);
   const selectedFilesRef = useRef(selectedFiles);
   const sidebarWidthRef = useRef(sidebarWidth);
   const treeWidthRef = useRef(treeWidth);
+  const chatWidthRef = useRef(chatWidth);
   const pathsRef = useRef<string[]>([]);
   selectedFilesRef.current = selectedFiles;
   sidebarWidthRef.current = sidebarWidth;
   treeWidthRef.current = treeWidth;
+  chatWidthRef.current = chatWidth;
 
   const systemDark = useMediaQuery("(prefers-color-scheme: dark)");
   const themeType: "dark" | "light" =
@@ -190,6 +199,13 @@ export default function App() {
   useEffect(() => {
     setSelectionCleared(false);
     setView("head");
+    const pendingFile = pendingFileRef.current;
+    if (selectedProjectPath !== null && pendingFile !== null) {
+      pendingFileRef.current = null;
+      setSelectedFile(pendingFile);
+      rememberFile(pendingFile);
+      return;
+    }
     setSelectedFile(
       selectedProjectPath === null ? null : (selectedFilesRef.current[selectedProjectPath] ?? null),
     );
@@ -213,6 +229,14 @@ export default function App() {
         if (searchRef.current === null) return;
         event.preventDefault();
         searchRef.current();
+        return;
+      }
+      if (meta && key === "l") {
+        event.preventDefault();
+        setChatOpen((current) => {
+          writeBoolean(storageKeys.chatOpen, !current);
+          return !current;
+        });
         return;
       }
       if (meta && /^[1-9]$/.test(event.key)) {
@@ -246,6 +270,27 @@ export default function App() {
       writeSelectedFiles(next);
       return next;
     });
+  };
+
+  const toggleChat = () => {
+    setChatOpen((current) => {
+      writeBoolean(storageKeys.chatOpen, !current);
+      return !current;
+    });
+  };
+
+  /** A citation aims the diff pane at the cited project and file. */
+  const focusCitation = (citation: ChatCitation) => {
+    if (citation.projectPath !== selectedProjectPath) {
+      pendingFileRef.current = citation.filePath;
+      setSelectedProjectPath(citation.projectPath);
+      return;
+    }
+    if (citation.filePath !== null) {
+      setSelectionCleared(false);
+      setSelectedFile(citation.filePath);
+      rememberFile(citation.filePath);
+    }
   };
 
   const replaceProjects = async (paths: string[]): Promise<boolean> => {
@@ -331,6 +376,16 @@ export default function App() {
             Grove
           </span>
           <span className="flex flex-1 justify-end">
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Toggle chat"
+              aria-pressed={chatOpen}
+              title="Toggle chat (⌘L)"
+              onClick={toggleChat}
+            >
+              <MessageSquareText size={15} />
+            </Button>
             <ToggleGroup
               aria-label="Theme"
               className={segmentedControlRootClassName}
@@ -395,7 +450,9 @@ export default function App() {
                   </EmptyDescription>
                 </EmptyHeader>
                 <EmptyContent>
-                  <Button onClick={() => setAddRequest((current) => current + 1)}>Add project</Button>
+                  <Button onClick={() => setAddRequest((current) => current + 1)}>
+                    Add project
+                  </Button>
                   <p className="text-xs text-muted-foreground">
                     Grove reads the worktree against HEAD. It never stages, commits, or pushes.
                   </p>
@@ -481,6 +538,31 @@ export default function App() {
             </div>
           ) : (
             <main className="min-w-0 flex-1" />
+          )}
+
+          {chatOpen && (
+            <>
+              <Splitter
+                label="Resize chat"
+                onResize={(delta) =>
+                  setChatWidth((current) => {
+                    const next = clamp(current - delta, CHAT_WIDTH.min, CHAT_WIDTH.max);
+                    chatWidthRef.current = next;
+                    return next;
+                  })
+                }
+                onResizeEnd={() => writeNumber(storageKeys.chatWidth, chatWidthRef.current)}
+              />
+              <ChatPanel
+                context={{
+                  projectPath: selectedProject?.path ?? null,
+                  filePath: selectedFile,
+                }}
+                width={chatWidth}
+                onCitationClick={focusCitation}
+                onClose={toggleChat}
+              />
+            </>
           )}
         </div>
       </div>

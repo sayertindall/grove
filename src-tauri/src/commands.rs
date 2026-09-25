@@ -181,7 +181,7 @@ pub async fn open_path<R: Runtime>(app: AppHandle<R>, path: String) -> Result<()
     .await
 }
 
-async fn blocking<T, F>(work: F) -> Result<T, String>
+pub(crate) async fn blocking<T, F>(work: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
@@ -190,6 +190,119 @@ where
         .await
         .map_err(|error| format!("the read task did not finish: {error}"))?
 }
+
+// --- Chat commands ---------------------------------------------------------------
+// Settings/history/keys live in files under the app-data dir so the CLI reads the
+// same ones without an AppHandle. chat_send streams by event, not by return value.
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn chat_settings() -> Result<crate::chat::ChatSettings, String> {
+    blocking(crate::chat::load_chat_settings).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn set_chat_settings(
+    settings: crate::chat::ChatSettings,
+) -> Result<crate::chat::ChatSettings, String> {
+    blocking(move || crate::chat::save_chat_settings(&settings)).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn chat_key_status(provider: String) -> Result<bool, String> {
+    blocking(move || {
+        let (provider, base_url) = provider_and_base_url(&provider)?;
+        Ok(crate::chat::chat_key_status(provider, &base_url))
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn set_chat_key(provider: String, key: String) -> Result<(), String> {
+    blocking(move || {
+        let (provider, _) = provider_and_base_url(&provider)?;
+        crate::chat::store_chat_key(provider, &key)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn clear_chat_key(provider: String) -> Result<(), String> {
+    blocking(move || {
+        let (provider, _) = provider_and_base_url(&provider)?;
+        crate::chat::clear_chat_key(provider)
+    })
+    .await
+}
+
+#[tauri::command()]
+pub async fn chat_history() -> Result<Vec<crate::chat::ChatMessage>, String> {
+    blocking(crate::chat::load_chat_history).await
+}
+
+#[tauri::command()]
+pub async fn chat_clear() -> Result<(), String> {
+    blocking(crate::chat::clear_chat_history).await
+}
+
+/// Starts one turn; results arrive as `grove://chat-*` events on the turn id.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn chat_send(
+    app: AppHandle,
+    request: crate::chat::ChatSendRequest,
+) -> Result<(), String> {
+    let settings = crate::chat::load_chat_settings()?;
+    let sink = Arc::new(EventSink { app });
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::chat::send_turn(sink, settings, request).await;
+    });
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn chat_cancel(turn_id: String) -> Result<(), String> {
+    crate::chat::cancel_turn(&turn_id);
+    Ok(())
+}
+
+/// Emits the turn's events on the `grove://chat-*` channels the frontend
+/// subscribes to once for the app's lifetime.
+struct EventSink {
+    app: AppHandle,
+}
+
+impl crate::chat::ChatSink for EventSink {
+    fn emit(&self, event: &crate::chat::ChatEvent) {
+        use crate::chat::ChatEvent;
+
+        let channel = match event {
+            ChatEvent::Delta { .. } => "grove://chat-delta",
+            ChatEvent::Reasoning { .. } => "grove://chat-reasoning",
+            ChatEvent::Tool { .. } => "grove://chat-tool",
+            ChatEvent::Done { .. } => "grove://chat-done",
+            ChatEvent::Error { .. } => "grove://chat-error",
+        };
+        if let Err(error) = self.app.emit(channel, event) {
+            eprintln!("{channel}: {error}");
+        }
+    }
+}
+
+/// The provider id comes from the frontend as a plain string; validate it and pair
+/// it with the currently stored base URL so env-var matching sees the right host.
+fn provider_and_base_url(
+    provider: &str,
+) -> Result<(crate::chat::ProviderKindWire, String), String> {
+    let provider = match provider {
+        "openai-compatible" => crate::chat::ProviderKindWire::OpenAiCompatible,
+        "anthropic" => crate::chat::ProviderKindWire::Anthropic,
+        other => return Err(format!("{other}: unknown provider")),
+    };
+    let base_url = crate::chat::load_chat_settings()?.base_url;
+    Ok((provider, base_url))
+}
+
+use std::sync::Arc;
+use tauri::Emitter;
 
 #[cfg(test)]
 mod tests {

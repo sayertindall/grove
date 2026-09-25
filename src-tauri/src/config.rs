@@ -24,6 +24,14 @@ pub fn load_project_paths<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<String>,
         .map_err(|error| format!("{PROJECTS_STORE_FILE}: {PROJECTS_KEY}: {error}"))
 }
 
+/// Loads the stored project paths without an AppHandle, for the CLI. This is
+/// the chat module's store reader, not a second implementation: both the GUI
+/// (`load_project_paths`) and the CLI read the same file. A missing store file
+/// is an empty list, so `status` on a fresh machine still works.
+pub fn load_registered_paths() -> Result<Vec<String>, String> {
+    crate::chat::load_registered_projects()
+}
+
 /// Writes the list and flushes it, so the next launch reads exactly what the sidebar
 /// shows now.
 pub fn save_project_paths<R: Runtime>(app: &AppHandle<R>, paths: &[String]) -> Result<(), String> {

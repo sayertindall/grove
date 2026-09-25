@@ -1,3 +1,5 @@
+pub mod chat;
+pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod discovery;
@@ -28,6 +30,15 @@ pub fn run() {
             commands::get_file_diff,
             commands::reveal_in_finder,
             commands::open_path,
+            commands::chat_settings,
+            commands::set_chat_settings,
+            commands::chat_key_status,
+            commands::set_chat_key,
+            commands::clear_chat_key,
+            commands::chat_history,
+            commands::chat_send,
+            commands::chat_cancel,
+            commands::chat_clear,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

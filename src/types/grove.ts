@@ -89,3 +89,106 @@ export interface FileDiff {
 export interface ProjectsChanged {
   paths: string[];
 }
+
+/* ------------------------------------------------------------------ *
+ * Chat
+ * ------------------------------------------------------------------ */
+
+export type ChatRole = "user" | "assistant";
+
+export type ChatToolStatus = "running" | "ok" | "error";
+
+/** A place an answer came from. Deterministic for tool-read sources. */
+export interface ChatCitation {
+  projectPath: string;
+  filePath: string | null;
+  /** 1-based, when the source is a line range. */
+  startLine: number | null;
+  endLine: number | null;
+  /** What to render, e.g. `dsg-platform/apps/kernel/src/case-lifecycle.ts:42`. */
+  label: string;
+}
+
+export interface ChatToolRun {
+  callId: string;
+  name: string;
+  status: ChatToolStatus;
+  /** One line describing the call, e.g. `read_diff apps/kernel/src/x.ts`. */
+  detail: string;
+  /** Set once the tool finished successfully. */
+  sources: ChatCitation[];
+}
+
+export interface ChatMessage {
+  id: string;
+  role: ChatRole;
+  text: string;
+  /** Reasoning that preceded the answer, when the provider streamed it. */
+  reasoning: string;
+  tools: ChatToolRun[];
+  citations: ChatCitation[];
+  /** Provider/model that produced an assistant message. */
+  model: string | null;
+  /** Epoch milliseconds. */
+  createdAt: number;
+  /** Set when the turn failed. */
+  error: string | null;
+}
+
+export type ChatProviderKind = "openai-compatible" | "anthropic";
+
+export interface ChatSettings {
+  provider: ChatProviderKind;
+  baseUrl: string;
+  model: string;
+  maxTokens: number;
+  temperature: number | null;
+  /**
+   * Explicit acknowledgement that workspace data may leave the machine for this
+   * provider. A turn refuses to start while this is false for a remote host.
+   */
+  allowCloudEgress: boolean;
+}
+
+export interface ChatContext {
+  projectPath: string | null;
+  filePath: string | null;
+}
+
+export interface ChatSendRequest {
+  turnId: string;
+  text: string;
+  context: ChatContext;
+}
+
+export interface ChatDeltaEvent {
+  turnId: string;
+  text: string;
+}
+
+export interface ChatReasoningEvent {
+  turnId: string;
+  text: string;
+}
+
+export interface ChatToolEvent {
+  turnId: string;
+  tool: ChatToolRun;
+}
+
+export interface ChatDoneEvent {
+  turnId: string;
+  messageId: string;
+  text: string;
+  reasoning: string;
+  citations: ChatCitation[];
+  model: string | null;
+  /** Total tokens when the provider reported them. */
+  totalTokens: number | null;
+}
+
+export interface ChatErrorEvent {
+  turnId: string;
+  message: string;
+  retryable: boolean;
+}

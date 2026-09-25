@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# The vendored component library is a delivery vehicle for the port under
+# src/components/beautiful, not repository content: it is a full Next.js app with
+# ~980 MB of node_modules and build output. The port carries the upstream URL and
+# the MIT notice. Safe to delete the directory once the port is verified.
+beautiful-ui/
+

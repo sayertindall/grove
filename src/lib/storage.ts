@@ -9,6 +9,8 @@ export const storageKeys = {
   treeWidth: "grove.treeWidth",
   projectSort: "grove.projectSort",
   hideClean: "grove.hideClean",
+  chatOpen: "grove.chatOpen",
+  chatWidth: "grove.chatWidth",
 } as const;
 
 export type ThemePreference = "system" | "dark" | "light";
@@ -18,6 +20,7 @@ export type ProjectSort = "stored" | "dirty" | "name";
 
 export const SIDEBAR_WIDTH = { min: 180, max: 420, fallback: 240 } as const;
 export const TREE_WIDTH = { min: 180, max: 640, fallback: 280 } as const;
+export const CHAT_WIDTH = { min: 280, max: 640, fallback: 400 } as const;
 
 function readRaw(key: string): string | null {
   try {

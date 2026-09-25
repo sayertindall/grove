@@ -901,6 +901,342 @@ fn saturating_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
+// --- Chat read-only helpers ---------------------------------------------------
+// Everything below serves the chat tool set: bounded, read-only, no writes.
+
+/// One entry of `list_worktrees`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInfo {
+    pub name: String,
+    pub path: String,
+    pub branch: Option<String>,
+    pub head_short: Option<String>,
+    pub locked: bool,
+    pub main: bool,
+    /// True when git considers the worktree prunable (its directory is gone or
+    /// its metadata is invalid), so stale rows stay visible instead of vanishing.
+    pub prunable: bool,
+}
+
+/// The main worktree of the repository behind a registered project: the
+/// project's own path unless it is a linked worktree, in which case the
+/// repository's main worktree path. Grouping key so several registered
+/// projects backed by one repository can be deduplicated.
+pub fn repository_main_path(project_path: &str) -> Result<String, String> {
+    let path = canonical_project_path(project_path)?;
+    let repository = open_repository(&path)?;
+    let main = match main_worktree_path(&repository) {
+        Some(main) => main,
+        None => repository
+            .workdir()
+            .map(|workdir| workdir.to_string_lossy().into_owned())
+            .ok_or_else(|| format!("{path}: bare repository has no worktree"))?,
+    };
+    // `workdir` carries a trailing slash while the canonicalized linked-worktree
+    // parent does not; both must produce the same grouping key.
+    Ok(main.trim_end_matches('/').to_string())
+}
+
+/// One entry of `recent_commits` / `file_history`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitInfo {
+    pub id: String,
+    pub short: String,
+    pub subject: String,
+    pub author: String,
+    /// Unix seconds.
+    pub date: i64,
+}
+
+/// One line of `blame`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameLine {
+    /// 1-based worktree line number.
+    pub line: u32,
+    pub commit: String,
+    pub short: String,
+    pub author: String,
+    /// Unix seconds.
+    pub date: i64,
+}
+
+/// One match of `search_changes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeMatch {
+    pub project: String,
+    pub file: String,
+    /// 1-based.
+    pub line: u32,
+    pub text: String,
+}
+
+/// The hard cap on `blame` rows, so one huge answer cannot flood the model.
+pub const MAX_BLAME_LINES: usize = 400;
+
+/// The hard cap on commit listings.
+pub const MAX_COMMIT_LIMIT: usize = 50;
+
+/// The main worktree first, then every linked worktree. Locked and prunable
+/// worktrees report it.
+pub fn read_worktrees(project_path: &str) -> Result<Vec<WorktreeInfo>, String> {
+    let path = canonical_project_path(project_path)?;
+    let repository = open_repository(&path)?;
+
+    let mut rows = Vec::new();
+    if let Some(workdir) = repository.workdir() {
+        rows.push(worktree_info("main", workdir, true));
+    }
+    let names = repository.worktrees().map_err(|error| error.to_string())?;
+    for index in 0..names.len() {
+        let Ok(Some(name)) = names.get(index) else { continue };
+        let worktree = repository
+            .find_worktree(name)
+            .map_err(|error| format!("{name}: {error}"))?;
+        let locked = worktree
+            .is_locked()
+            .map(|status| !matches!(status, git2::WorktreeLockStatus::Unlocked))
+            .unwrap_or(false);
+        // No flags: a valid, present worktree is not prunable; only stale
+        // metadata (gone/invalid directories) reports it.
+        let mut prune_options = git2::WorktreePruneOptions::new();
+        let prunable = worktree.is_prunable(Some(&mut prune_options)).unwrap_or(false);
+        rows.push(worktree_info(name, worktree.path(), false));
+        if let Some(row) = rows.last_mut() {
+            row.locked = locked;
+            row.prunable = prunable;
+        }
+    }
+    Ok(rows)
+}
+
+fn worktree_info(name: &str, path: &Path, main: bool) -> WorktreeInfo {
+    let mut row = WorktreeInfo {
+        name: name.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        branch: None,
+        head_short: None,
+        locked: false,
+        main,
+        prunable: false,
+    };
+    if let Ok(repository) = Repository::open(path) {
+        if let Ok(head) = repository.head() {
+            row.branch = head.shorthand().ok().map(str::to_string);
+            if let Some(oid) = head.target() {
+                row.head_short = abbreviate(&repository, oid);
+            }
+        }
+    }
+    row
+}
+
+/// Newest first, capped. An unborn branch yields an empty list.
+pub fn read_recent_commits(project_path: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    let path = canonical_project_path(project_path)?;
+    let repository = open_repository(&path)?;
+    let mut walk = repository.revwalk().map_err(|error| error.to_string())?;
+    if walk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    walk.set_sorting(git2::Sort::TIME).map_err(|error| error.to_string())?;
+    commits_from_walk(&repository, walk, limit)
+}
+
+/// Commits that touched one path, newest first, capped.
+pub fn read_file_history(
+    project_path: &str,
+    file_path: &str,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, String> {
+    let path = canonical_project_path(project_path)?;
+    let repository = open_repository(&path)?;
+    let mut walk = repository.revwalk().map_err(|error| error.to_string())?;
+    if walk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    walk.set_sorting(git2::Sort::TIME).map_err(|error| error.to_string())?;
+
+    let limit = limit.min(MAX_COMMIT_LIMIT);
+    let mut rows = Vec::new();
+    for oid in walk {
+        if rows.len() >= limit {
+            break;
+        }
+        let oid = oid.map_err(|error| error.to_string())?;
+        let commit = repository
+            .find_commit(oid)
+            .map_err(|error| error.to_string())?;
+        if !commit_touches_path(&repository, &commit, file_path) {
+            continue;
+        }
+        rows.push(commit_info(&repository, oid, &commit));
+    }
+    Ok(rows)
+}
+
+/// True when the file's blob id at this commit differs from every parent's, so
+/// merges that only carry the change forward are skipped.
+fn commit_touches_path(repository: &Repository, commit: &git2::Commit<'_>, file_path: &str) -> bool {
+    let entry_id = |tree: &Tree| -> Option<Oid> {
+        tree.get_path(Path::new(file_path))
+            .ok()
+            .map(|entry| entry.id())
+    };
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
+    let Some(here) = entry_id(&tree) else {
+        return false;
+    };
+    let parent_ids: Vec<_> = commit.parent_ids().collect();
+    if parent_ids.is_empty() {
+        return true;
+    }
+    !parent_ids.iter().any(|parent| {
+        repository
+            .find_commit(*parent)
+            .ok()
+            .and_then(|parent| parent.tree().ok())
+            .and_then(|tree| entry_id(&tree))
+            .is_some_and(|id| id == here)
+    })
+}
+
+fn commit_info(repository: &Repository, oid: Oid, commit: &git2::Commit<'_>) -> CommitInfo {
+    let subject = commit
+        .summary()
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .to_string();
+    CommitInfo {
+        id: oid.to_string(),
+        short: abbreviate(repository, oid).unwrap_or_else(|| oid.to_string()[..7].to_string()),
+        subject,
+        author: commit.author().name().unwrap_or_default().to_string(),
+        date: commit.time().seconds(),
+    }
+}
+
+fn commits_from_walk(
+    repository: &Repository,
+    walk: git2::Revwalk<'_>,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, String> {
+    let limit = limit.min(MAX_COMMIT_LIMIT);
+    let mut rows = Vec::with_capacity(limit);
+    for oid in walk.take(limit) {
+        let oid = oid.map_err(|error| error.to_string())?;
+        let commit = repository
+            .find_commit(oid)
+            .map_err(|error| error.to_string())?;
+        rows.push(commit_info(repository, oid, &commit));
+    }
+    Ok(rows)
+}
+
+/// Per-line provenance for one file, 1-based inclusive range, capped at
+/// `MAX_BLAME_LINES`.
+pub fn read_blame(
+    project_path: &str,
+    file_path: &str,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> Result<Vec<BlameLine>, String> {
+    let path = canonical_project_path(project_path)?;
+    let repository = open_repository(&path)?;
+    let blame = repository
+        .blame_file(Path::new(file_path), None)
+        .map_err(|error| format!("{file_path}: {error}"))?;
+
+    let start = start_line.unwrap_or(1).max(1);
+    let end = end_line.unwrap_or(u32::MAX).max(start);
+    let mut rows = Vec::new();
+    for line in start..=end {
+        if rows.len() >= MAX_BLAME_LINES {
+            break;
+        }
+        let Some(hunk) = blame.get_line(line as usize) else {
+            break;
+        };
+        let commit_id = hunk.final_commit_id();
+        let (author, date) = repository
+            .find_commit(commit_id)
+            .map(|commit| {
+                (
+                    commit.author().name().unwrap_or_default().to_string(),
+                    commit.time().seconds(),
+                )
+            })
+            .unwrap_or_default();
+        rows.push(BlameLine {
+            line,
+            commit: commit_id.to_string(),
+            short: abbreviate(&repository, commit_id)
+                .unwrap_or_else(|| commit_id.to_string()[..7].to_string()),
+            author,
+            date,
+        });
+    }
+    Ok(rows)
+}
+
+/// Case-insensitive substring search over the text of every changed (including
+/// untracked) file of one project. Returns at most `max_matches` rows.
+pub fn search_changed_files(
+    project_path: &str,
+    query: &str,
+    max_matches: usize,
+) -> Result<Vec<ChangeMatch>, String> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = canonical_project_path(project_path)?;
+    let repository = open_repository(&path)?;
+    let workdir = repository
+        .workdir()
+        .ok_or_else(|| format!("{path}: bare repository has no worktree"))?;
+    let needle = query.to_lowercase();
+
+    let changes = read_project_changes(&path, false)?;
+    let mut matches = Vec::new();
+    for file in &changes.files {
+        if matches.len() >= max_matches {
+            break;
+        }
+        if file.binary {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(workdir.join(&file.path)) else {
+            continue;
+        };
+        if bytes.len() as u64 > MAX_TEXT_SIDE_BYTES {
+            continue;
+        }
+        let Ok(contents) = String::from_utf8(bytes) else {
+            continue;
+        };
+        for (offset, text) in contents.lines().enumerate() {
+            if text.to_lowercase().contains(&needle) {
+                matches.push(ChangeMatch {
+                    project: path.clone(),
+                    file: file.path.clone(),
+                    line: u32::try_from(offset + 1).unwrap_or(u32::MAX),
+                    text: text.chars().take(400).collect(),
+                });
+                if matches.len() >= max_matches {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(matches)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
