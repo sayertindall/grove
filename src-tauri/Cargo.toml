@@ -1,6 +1,6 @@
 [package]
 name = "grove"
-version = "0.1.1"
+version = "0.1.2"
 description = "Read-only viewer of git working-tree changes across registered repositories"
 edition = "2021"
 

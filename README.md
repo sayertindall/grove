@@ -64,17 +64,20 @@ A Tauri bundle ships a static `.icns`, so Grove keeps the classic icon.
 
 ## Release
 
-`.github/workflows/release.yml` builds the bundles and attaches them. Tag a version, or
-start a run from the Actions tab (which defaults to a draft release):
+`.github/workflows/release.yml` builds the bundles and publishes them. Push a tag to
+release, or start a run from the Actions tab:
 
 ```bash
-git tag app-v0.1.0 && git push origin app-v0.1.0
+git tag app-v0.1.2 && git push origin app-v0.1.2
 ```
 
 The workflow runs the Rust tests, builds `--target aarch64-apple-darwin` and
 `--target x86_64-apple-darwin` on `macos-latest`, uploads the `.dmg` and `.app` as run
-artifacts, and creates a GitHub release with the bundles attached (`tauri-action`
-replaces `__VERSION__` from `tauri.conf.json`).
+artifacts, and creates a GitHub release carrying both `.dmg` files, both zipped `.app`
+bundles, and the screenshot (`tauri-action` replaces `__VERSION__` from
+`tauri.conf.json`). The tag and the asset names both follow the version in
+`tauri.conf.json`, so bump that before tagging. A manual run publishes immediately unless
+you tick the draft box.
 
 Grove is not signed or notarized, so macOS quarantines the first launch of a downloaded
 bundle: right-click the app and choose Open, or

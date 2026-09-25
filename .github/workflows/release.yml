@@ -1,14 +1,14 @@
 name: release
 
-# Tag a version to publish a release, or start a run from the Actions tab to get the
-# bundles as run artifacts.
+# Push a tag (or start a run from the Actions tab) and GitHub builds both macOS
+# bundles, runs the Rust tests, and publishes the release with the artifacts on it.
 on:
   workflow_dispatch:
     inputs:
       draft:
-        description: Create the GitHub release as a draft
+        description: Publish the release as a draft instead
         type: boolean
-        default: true
+        default: false
   push:
     tags:
       - "app-v*"
@@ -26,17 +26,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - aarch64-apple-darwin # Apple silicon
-          - x86_64-apple-darwin # Intel
+        include:
+          - target: aarch64-apple-darwin
+            suffix: aarch64
+          - target: x86_64-apple-darwin
+            suffix: x64
     steps:
       - uses: actions/checkout@v7
 
       - name: install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: setup node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: lts/*
           cache: pnpm
@@ -57,24 +59,66 @@ jobs:
       - name: test the read paths
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      # The release tag and the asset names both follow the app version, so it is read
+      # from the bundled config rather than from `github.ref` (which is a branch on a
+      # manual run).
+      - name: read the app version
+        id: app
+        run: |
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=app-v$version" >> "$GITHUB_OUTPUT"
+
       - name: build the bundles and publish the release
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: app-v__VERSION__
+          tagName: ${{ steps.app.outputs.tag }}
           releaseName: "Grove v__VERSION__"
           releaseBody: |
-            Read-only viewer of git working-tree changes across the repositories you register.
+            Read-only viewer of git working-tree changes across the repositories you
+            register. It never stages, commits, pushes, pulls, edits files, or opens a
+            network connection.
 
-            macOS bundles are unsigned, so the first launch of a downloaded copy needs
-            right-click → Open.
+            ### Install
+
+            1. Download `Grove___VERSION___aarch64.dmg` (Apple silicon) or
+               `Grove___VERSION___x64.dmg` (Intel) and open it.
+            2. Drag **Grove** to Applications.
+
+            The bundles are unsigned, so the first launch of a downloaded copy is
+            quarantined by Gatekeeper. Right-click the app and choose **Open** once, or:
+
+            ```bash
+            xattr -dr com.apple.quarantine /Applications/Grove.app
+            ```
+
+            `Grove___VERSION___*.app.zip` is the same bundle zipped, if you would rather
+            not mount a disk image.
           releaseDraft: ${{ inputs.draft || false }}
           prerelease: false
           args: --target ${{ matrix.target }}
 
+      # tauri-action attaches what the bundler produced. The zipped app and the
+      # screenshot are added here so the release matches what a local build ships.
+      - name: attach the zipped app and the screenshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          app="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Grove.app"
+          zip="/tmp/Grove_${{ steps.app.outputs.version }}_${{ matrix.suffix }}.app.zip"
+          ditto -c -k --keepParent "$app" "$zip"
+          gh release upload "${{ steps.app.outputs.tag }}" "$zip" --clobber
+
+      - name: attach the screenshot
+        if: matrix.suffix == 'aarch64'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.app.outputs.tag }}" docs/grove-screenshot.png --clobber
+
       - name: upload the bundles as run artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: grove-${{ matrix.target }}
           path: |
