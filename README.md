@@ -51,10 +51,10 @@ GROVE_LARGE_REPO=/path/to/a/big/repo \
 
 ## Icon
 
-`design/grove-icon.svg` is the source art: a 1024 canvas holding the macOS tile (824 px,
-inset 100 px, continuous-corner squircle sampled from a superellipse rather than drawn with
-arcs), three firs, the tallest in the same emerald the UI uses for additions. `pnpm icon`
-regenerates `src-tauri/icons` from it, including the `.icns` layer set the bundle wants.
+`design/grove-icon.svg` is the source art: a 1024 canvas with a charcoal continuous-corner
+tile (824 px, inset 100 px) and a lime two-leaf sprout on it, transparent outside the tile.
+`pnpm icon` regenerates `src-tauri/icons` from it, including the `.icns` layer set the bundle
+wants.
 
 The CLI also emits iOS, Android, and Microsoft Store variants; a macOS-only bundle
 references none of them, so those files are deleted after each run.
