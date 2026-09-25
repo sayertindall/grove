@@ -1,4 +1,3 @@
-
 import { useEffect, useState } from "react";
 
 /* ─────────────────────────────────────────────────────────
@@ -18,33 +17,13 @@ const TOKENS: StreamingToken[] = [
     .split(" ")
     .map((text) => ({ text })),
   { text: "", cite: true },
-  ..."Stone-fruit flavors are trending in the same range."
-    .split(" ")
-    .map((text) => ({ text })),
+  ..."Stone-fruit flavors are trending in the same range.".split(" ").map((text) => ({ text })),
 ];
 
-const FOLLOW_UPS = [
-  "Which flavors sell best in winter",
-  "Compare gelato and soft serve margins",
-];
-
-const SOURCE_IMAGES = {
-  scoop:
-    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f7a5f'/%3E%3Cpath d='M20 36c0 7 5.4 12 12 12s12-5 12-12H20Z' fill='%23fff'/%3E%3Ccircle cx='32' cy='25' r='11' fill='%23bff3dd'/%3E%3Cpath d='M24 24c4-7 13-7 17 0' fill='none' stroke='%231f7a5f' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E",
-  trends:
-    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%232f6fec'/%3E%3Cpath d='M15 43 27 31l8 7 14-18' fill='none' stroke='%23fff' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='49' cy='20' r='5' fill='%23bfe0ff'/%3E%3C/svg%3E",
-  market:
-    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23e56d24'/%3E%3Cpath d='M17 45V25h8v20h-8Zm11 0V16h8v29h-8Zm11 0V30h8v15h-8Z' fill='%23fff'/%3E%3Cpath d='M16 49h32' stroke='%23ffd6b8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E",
-};
+const FOLLOW_UPS = ["Which flavors sell best in winter", "Compare gelato and soft serve margins"];
 
 /* one cited source rendered as an inline chip and in the sources list */
 export type StreamingSource = { name: string; domain: string; href: string; image: string };
-
-const SOURCES: StreamingSource[] = [
-  { name: "Scoop Data", domain: "scoopdata.io", href: "https://scoopdata.io/", image: SOURCE_IMAGES.scoop },
-  { name: "Trends Index", domain: "trends.google.com", href: "https://trends.google.com/trends/", image: SOURCE_IMAGES.trends },
-  { name: "Market Basket", domain: "marketbasket.io", href: "https://marketbasket.io/", image: SOURCE_IMAGES.market },
-];
 
 function sourceImage(source: StreamingSource) {
   return source.image;
@@ -69,10 +48,19 @@ function SourceChip({ source }: { source?: StreamingSource }) {
 }
 
 const ACTION_ICONS: React.ReactNode[] = [
-  <g key="copy"><rect x="9" y="9" width="12" height="12" rx="2.5" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></g>,
+  <g key="copy">
+    <rect x="9" y="9" width="12" height="12" rx="2.5" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </g>,
   <path key="retry" d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />,
-  <path key="up" d="M7 10v12M15 5.88L14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88z" />,
-  <path key="down" d="M17 14V2M9 18.12L10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88z" />,
+  <path
+    key="up"
+    d="M7 10v12M15 5.88L14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88z"
+  />,
+  <path
+    key="down"
+    d="M17 14V2M9 18.12L10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88z"
+  />,
 ];
 
 export type StreamingLabels = {
@@ -89,7 +77,7 @@ const DEFAULT_LABELS: StreamingLabels = {
 
 export default function StreamingText({
   content = TOKENS,
-  sources = SOURCES,
+  sources = [],
   followUps = FOLLOW_UPS,
   labels,
   loop = true,
@@ -165,7 +153,16 @@ export default function StreamingText({
             className="flex size-6 items-center justify-center rounded-[6px] text-ink-3
               transition-colors duration-100 hover:bg-hover-2 hover:text-ink-2"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
               {icon}
             </svg>
           </button>
@@ -208,7 +205,11 @@ export default function StreamingText({
                 rel="noreferrer"
                 className="flex items-center gap-2 rounded-[6px] px-1.5 py-1 text-[12px] text-ink-2 transition-colors duration-150 hover:bg-hover hover:text-ink"
               >
-                <img src={sourceImage(source)} alt="" className="source-avatar size-4 rounded-[4px]" />
+                <img
+                  src={sourceImage(source)}
+                  alt=""
+                  className="source-avatar size-4 rounded-[4px]"
+                />
                 <span className="animated-underline">{source.name}</span>
                 <span className="ml-auto font-mono text-[10.5px] text-ink-3">{source.domain}</span>
               </a>
@@ -237,7 +238,17 @@ export default function StreamingText({
                   : { opacity: 0 }
               }
             >
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--ink-3)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+              <svg
+                width="11"
+                height="11"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="var(--ink-3)"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="shrink-0"
+              >
                 <path d="M9 10l-5 5 5 5" />
                 <path d="M20 4v7a4 4 0 0 1-4 4H4" />
               </svg>

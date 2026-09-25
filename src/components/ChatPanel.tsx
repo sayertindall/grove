@@ -765,7 +765,6 @@ export default function ChatPanel({
           </div>
         ) : (
           <PromptBar
-            demo={false}
             placeholder={
               providerReady && hasKey !== false
                 ? "Ask about this workspace's changes…"
