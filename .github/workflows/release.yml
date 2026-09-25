@@ -3,136 +3,162 @@ name: release
 # Push a tag (or start a run from the Actions tab) and GitHub builds both macOS
 # bundles, runs the Rust tests, and publishes the release with the artifacts on it.
 on:
-  workflow_dispatch:
-    inputs:
-      draft:
-        description: Publish the release as a draft instead
-        type: boolean
-        default: false
-  push:
-    tags:
-      - "app-v*"
+ workflow_dispatch:
+  inputs:
+   draft:
+    description: Publish the release as a draft instead
+    type: boolean
+    default: false
+ push:
+  tags:
+   - "app-v*"
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+ group: release-${{ github.ref }}
+ cancel-in-progress: false
 
 jobs:
-  build-macos:
-    name: grove ${{ matrix.target }}
-    runs-on: macos-latest
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            suffix: aarch64
-          - target: x86_64-apple-darwin
-            suffix: x64
-    steps:
-      - uses: actions/checkout@v7
+ build-macos:
+  name: grove ${{ matrix.target }}
+  runs-on: macos-latest
+  permissions:
+   contents: write
+  strategy:
+   fail-fast: false
+   matrix:
+    include:
+     - target: aarch64-apple-darwin
+       suffix: aarch64
+     - target: x86_64-apple-darwin
+       suffix: x64
+  steps:
+   - uses: actions/checkout@v7
 
-      - name: install pnpm
-        uses: pnpm/action-setup@v6
+   - name: install pnpm
+     uses: pnpm/action-setup@v6
 
-      - name: setup node
-        uses: actions/setup-node@v7
-        with:
-          node-version: lts/*
-          cache: pnpm
+   - name: setup node
+     uses: actions/setup-node@v7
+     with:
+      node-version: lts/*
+      cache: pnpm
 
-      - name: install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+   - name: install Rust
+     uses: dtolnay/rust-toolchain@stable
+     with:
+      targets: ${{ matrix.target }}
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "./src-tauri -> target"
+   - name: Rust cache
+     uses: Swatinem/rust-cache@v2
+     with:
+      workspaces: "./src-tauri -> target"
 
-      - name: install frontend dependencies
-        run: pnpm install --frozen-lockfile
+   - name: install frontend dependencies
+     run: pnpm install --frozen-lockfile
 
-      - name: test the read paths
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+   - name: test the read paths
+     run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      # The release tag and the asset names both follow the app version, so it is read
-      # from the bundled config rather than from `github.ref` (which is a branch on a
-      # manual run).
-      - name: read the app version
-        id: app
-        run: |
-          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=app-v$version" >> "$GITHUB_OUTPUT"
+   # The release tag and the asset names both follow the app version, so it is read
+   # from the bundled config rather than from `github.ref` (which is a branch on a
+   # manual run).
+   - name: read the app version
+     id: app
+     run: |
+      version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+      echo "version=$version" >> "$GITHUB_OUTPUT"
+      echo "tag=app-v$version" >> "$GITHUB_OUTPUT"
 
-      - name: build the bundles and publish the release
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ steps.app.outputs.tag }}
-          releaseName: "Grove v__VERSION__"
-          releaseBody: |
-            Read-only viewer of git working-tree changes across the repositories you
-            register. It never stages, commits, pushes, pulls, edits files, or opens a
-            network connection.
+   - name: build the bundles and publish the release
+     uses: tauri-apps/tauri-action@v1
+     env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+     with:
+      tagName: ${{ steps.app.outputs.tag }}
+      releaseName: "Grove v__VERSION__"
+      releaseBody: |
+       Read-only viewer of git working-tree changes across the repositories you
+       register. It never stages, commits, pushes, pulls, or edits files.
 
-            ### Install
+       ### The assistant
 
-            1. Download `Grove___VERSION___aarch64.dmg` (Apple silicon) or
-               `Grove___VERSION___x64.dmg` (Intel) and open it.
-            2. Drag **Grove** to Applications.
+       Press ⌘L for a chat that explains a project's changes from Grove's own facts. It
+       is not a coding agent: its entire capability is nine read-only tools (status,
+       change lists, diffs, file contents, a search across changed files, worktrees,
+       recent commits, file history, blame), each path-guarded to a registered project,
+       so it cannot write and cannot read outside them. Answers cite `path:line`, and
+       the source list comes from the tools it actually called.
 
-            The bundles are unsigned, so the first launch of a downloaded copy is
-            quarantined by Gatekeeper. Right-click the app and choose **Open** once, or:
+       Point it at an OpenAI-compatible endpoint (OpenAI, DeepSeek, Groq, OpenRouter, or
+       a local Ollama, LM Studio, or llama.cpp server) or Anthropic, with a model and a
+       key. A remote host needs an explicit acknowledgement before the first turn, and
+       nothing is transmitted until you send a message. Keys go to the macOS Keychain.
 
-            ```bash
-            xattr -dr com.apple.quarantine /Applications/Grove.app
-            ```
+       ### The CLI
 
-            `Grove___VERSION___*.app.zip` is the same bundle zipped, if you would rather
-            not mount a disk image.
-          releaseDraft: ${{ inputs.draft || false }}
-          prerelease: false
-          args: --target ${{ matrix.target }}
+       The app binary is also a read-only CLI, so scripts and agents see exactly what the
+       window shows:
 
-      # tauri-action attaches what the bundler produced. The zipped app and the
-      # screenshot are added here so the release matches what a local build ships.
-      - name: attach the zipped app and the screenshot
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          app="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Grove.app"
-          zip="/tmp/Grove_${{ steps.app.outputs.version }}_${{ matrix.suffix }}.app.zip"
-          ditto -c -k --keepParent "$app" "$zip"
-          gh release upload "${{ steps.app.outputs.tag }}" "$zip" --clobber
+       ```bash
+       grove status [--json]
+       grove changes [<project>] [--json]
+       grove diff <project> <file> [--view head|staged|unstaged] [--json]
+       grove worktrees [<project>] [--json]
+       grove ask "what changed here?" [--project <path>]
+       ```
 
-      - name: attach the screenshot
-        if: matrix.suffix == 'aarch64'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ steps.app.outputs.tag }}" docs/grove-screenshot.png --clobber
+       ### Install
 
-      # tauri-action also attaches the bundle as .app.tar.gz for Tauri's updater, which
-      # Grove does not configure. The .zip above is the macOS-idiomatic twin of the same
-      # bytes, so the archives go, leaving one bundle per architecture on the release.
-      - name: drop the unused updater archives
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          base="Grove_${{ steps.app.outputs.version }}_${{ matrix.suffix }}.app.tar.gz"
-          gh release delete-asset "${{ steps.app.outputs.tag }}" "$base" --yes || true
-          gh release delete-asset "${{ steps.app.outputs.tag }}" "$base.sig" --yes || true
+       1. Download `Grove___VERSION___aarch64.dmg` (Apple silicon) or
+          `Grove___VERSION___x64.dmg` (Intel) and open it.
+       2. Drag **Grove** to Applications.
 
-      - name: upload the bundles as run artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: grove-${{ matrix.target }}
-          path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
-          if-no-files-found: error
+       The bundles are unsigned, so the first launch of a downloaded copy is
+       quarantined by Gatekeeper. Right-click the app and choose **Open** once, or:
+
+       ```bash
+       xattr -dr com.apple.quarantine /Applications/Grove.app
+       ```
+
+       `Grove___VERSION___*.app.zip` is the same bundle zipped, if you would rather
+       not mount a disk image.
+      releaseDraft: ${{ inputs.draft || false }}
+      prerelease: false
+      args: --target ${{ matrix.target }}
+
+   # tauri-action attaches what the bundler produced. The zipped app and the
+   # screenshot are added here so the release matches what a local build ships.
+   - name: attach the zipped app and the screenshot
+     env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+     run: |
+      app="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Grove.app"
+      zip="/tmp/Grove_${{ steps.app.outputs.version }}_${{ matrix.suffix }}.app.zip"
+      ditto -c -k --keepParent "$app" "$zip"
+      gh release upload "${{ steps.app.outputs.tag }}" "$zip" --clobber
+
+   - name: attach the screenshot
+     if: matrix.suffix == 'aarch64'
+     env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+     run: gh release upload "${{ steps.app.outputs.tag }}" docs/grove-screenshot.png --clobber
+
+   # tauri-action also attaches the bundle as .app.tar.gz for Tauri's updater, which
+   # Grove does not configure. The .zip above is the macOS-idiomatic twin of the same
+   # bytes, so the archives go, leaving one bundle per architecture on the release.
+   - name: drop the unused updater archives
+     env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+     run: |
+      base="Grove_${{ steps.app.outputs.version }}_${{ matrix.suffix }}.app.tar.gz"
+      gh release delete-asset "${{ steps.app.outputs.tag }}" "$base" --yes || true
+      gh release delete-asset "${{ steps.app.outputs.tag }}" "$base.sig" --yes || true
+
+   - name: upload the bundles as run artifacts
+     uses: actions/upload-artifact@v7
+     with:
+      name: grove-${{ matrix.target }}
+      path: |
+       src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+       src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+      if-no-files-found: error
