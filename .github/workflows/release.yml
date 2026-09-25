@@ -117,6 +117,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${{ steps.app.outputs.tag }}" docs/grove-screenshot.png --clobber
 
+      # tauri-action also attaches the bundle as .app.tar.gz for Tauri's updater, which
+      # Grove does not configure. The .zip above is the macOS-idiomatic twin of the same
+      # bytes, so the archives go, leaving one bundle per architecture on the release.
+      - name: drop the unused updater archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          base="Grove_${{ steps.app.outputs.version }}_${{ matrix.suffix }}.app.tar.gz"
+          gh release delete-asset "${{ steps.app.outputs.tag }}" "$base" --yes || true
+          gh release delete-asset "${{ steps.app.outputs.tag }}" "$base.sig" --yes || true
+
       - name: upload the bundles as run artifacts
         uses: actions/upload-artifact@v7
         with:
