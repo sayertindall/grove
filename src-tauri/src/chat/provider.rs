@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long connecting may take before the turn fails.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a stream may stay silent between chunks before the turn fails.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One streamed provider event.
 #[derive(Debug, Clone)]
@@ -189,6 +191,8 @@ impl Adapter for OpenAiAdapter {
             #[serde(default)]
             choices: Vec<Choice>,
             usage: Option<Usage>,
+            #[serde(default)]
+            error: Option<Value>,
         }
         #[derive(Deserialize)]
         struct Choice {
@@ -223,6 +227,13 @@ impl Adapter for OpenAiAdapter {
             // Unrecognized frames are skipped; the contract's frames all parse.
             return Ok(());
         };
+        if let Some(error) = &parsed.error {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(format!("provider error: {message}"));
+        }
         for choice in &parsed.choices {
             if let Some(text) = nonempty(&choice.delta.content) {
                 outcome.text.push_str(text);
@@ -479,7 +490,7 @@ impl Adapter for AnthropicAdapter {
             },
             "content_block_stop" => {
                 if let Some(call) = self.pending.remove(&parsed.index) {
-                    emit_call(&mut self.pending, &parsed.index, call, outcome, on);
+                    emit_call(&parsed.index, call, outcome, on);
                 }
             }
             "message_delta" => {
@@ -499,7 +510,7 @@ impl Adapter for AnthropicAdapter {
         on: &(dyn Fn(ProviderEvent) + Send + Sync),
     ) -> Result<(), String> {
         for (index, call) in std::mem::take(&mut self.pending) {
-            emit_call(&mut self.pending, &index, call, outcome, on);
+            emit_call(&index, call, outcome, on);
         }
         let usage = (self.input_tokens + self.output_tokens)
             .checked_add(0)
@@ -510,10 +521,8 @@ impl Adapter for AnthropicAdapter {
     }
 }
 
-/// Moves an assembled call into the outcome. `pending` is unused after removal;
-/// the signature keeps call sites uniform.
+/// Moves an assembled call into the outcome.
 fn emit_call(
-    _pending: &mut BTreeMap<usize, PendingToolCall>,
     index: &usize,
     call: PendingToolCall,
     outcome: &mut StreamOutcome,
@@ -627,8 +636,8 @@ fn anthropic_message(message: &TurnMessage) -> Option<Value> {
 
 // --- Shared SSE plumbing ---------------------------------------------------------
 
-/// POSTs `body` and folds the SSE stream frame by frame. Non-2xx bodies are plain
-/// JSON errors; `data: [DONE]` or end-of-stream ends the turn.
+/// POSTs `body` and folds the SSE stream frame by frame. `data: [DONE]` or
+/// end-of-stream ends the turn.
 async fn stream_sse<A: Adapter>(
     client: &reqwest::Client,
     url: String,
@@ -656,44 +665,113 @@ async fn stream_sse<A: Adapter>(
         let text = response.text().await.unwrap_or_default();
         return Err(describe_http_error(status.as_u16(), &text));
     }
+    if !is_event_stream(&response) {
+        let text = response.text().await.unwrap_or_default();
+        return Err(unstreamable_body(&text));
+    }
 
     let mut stream = response.bytes_stream();
-    let mut buffer: Vec<u8> = Vec::new();
     let mut outcome = StreamOutcome::default();
+    let mut lines = LineBuffer::default();
+    let mut event = String::new();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".to_string());
         }
-        let chunk = match tokio::time::timeout(REQUEST_TIMEOUT, stream.next()).await {
+        let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
             Ok(chunk) => chunk,
-            Err(_elapsed) => return Err("the provider stream timed out".to_string()),
+            Err(_elapsed) => return Err("the provider stream stalled".to_string()),
         };
         let Some(chunk) = chunk.transpose().map_err(|error| transport_error(&error))? else {
             break;
         };
 
-        buffer.extend_from_slice(&chunk);
-        while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = buffer.drain(..=position).collect();
-            let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]);
-            let Some(payload) = line.trim_end_matches('\r').strip_prefix("data:") else {
+        lines.extend(&chunk);
+        while let Some(line) = lines.next_line() {
+            // A blank line ends one SSE event; a chunk may carry many events.
+            if line.is_empty() {
+                if settle_event(&mut event, adapter, &mut outcome, on)? {
+                    return Ok(outcome);
+                }
+                continue;
+            }
+            let Some(payload) = line.strip_prefix("data:") else {
                 continue;
             };
-            let payload = payload.trim();
-            if payload == "[DONE]" {
-                adapter.finish(&mut outcome, on)?;
-                return Ok(outcome);
+            if !event.is_empty() {
+                event.push('\n');
             }
-            if payload.is_empty() {
-                continue;
-            }
-            adapter.fold(payload, &mut outcome, on)?;
+            event.push_str(payload.strip_prefix(' ').unwrap_or(payload));
         }
+    }
+    // A final event may arrive without its terminating blank line, and
+    // `[DONE]` itself is not guaranteed a trailing newline.
+    if settle_event(&mut event, adapter, &mut outcome, on)? {
+        return Ok(outcome);
     }
 
     adapter.finish(&mut outcome, on)?;
     Ok(outcome)
+}
+
+/// Drains one complete `data:` event and folds it. Returns true when the event
+/// was the terminating `[DONE]` (the outcome is then final).
+fn settle_event<A: Adapter>(
+    event: &mut String,
+    adapter: &mut A,
+    outcome: &mut StreamOutcome,
+    on: &(dyn Fn(ProviderEvent) + Send + Sync),
+) -> Result<bool, String> {
+    let payload = std::mem::take(event);
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return Ok(false);
+    }
+    if payload == "[DONE]" {
+        adapter.finish(outcome, on)?;
+        return Ok(true);
+    }
+    adapter.fold(payload, outcome, on)?;
+    Ok(false)
+}
+
+/// Splits the byte stream into complete lines, so multi-byte UTF-8 sequences cut
+/// across chunk boundaries are never decoded half-finished.
+#[derive(Default)]
+struct LineBuffer {
+    bytes: Vec<u8>,
+}
+
+impl LineBuffer {
+    fn extend(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    /// Next full line without its terminator, or nothing until more bytes arrive.
+    fn next_line(&mut self) -> Option<String> {
+        let end = self.bytes.iter().position(|byte| *byte == b'\n')?;
+        let line: Vec<u8> = self.bytes.drain(..=end).collect();
+        let body = &line[..line.len().saturating_sub(1)];
+        let text = String::from_utf8_lossy(body);
+        Some(text.trim_end_matches('\r').to_string())
+    }
+}
+
+fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+}
+
+/// A 2xx response that is not a stream: providers report some failures this way.
+fn unstreamable_body(text: &str) -> String {
+    let detail = ErrorEnvelope::from_text(text)
+        .and_then(|envelope| envelope.message())
+        .unwrap_or_else(|| text.chars().take(300).collect());
+    format!("the provider did not answer with a stream: {detail}")
 }
 
 fn transport_error(error: &reqwest::Error) -> String {
@@ -706,24 +784,32 @@ fn transport_error(error: &reqwest::Error) -> String {
     }
 }
 
-/// Turns a non-2xx body into one readable line. Both wire formats nest the
-/// message under an `error` object.
-fn describe_http_error(status: u16, text: &str) -> String {
-    #[derive(Deserialize)]
-    struct ErrorBody {
-        error: Option<Value>,
+/// Both wire formats nest failure details under an `error` object.
+#[derive(Deserialize)]
+struct ErrorEnvelope {
+    error: Option<Value>,
+}
+
+impl ErrorEnvelope {
+    fn from_text(text: &str) -> Option<ErrorEnvelope> {
+        serde_json::from_str::<ErrorEnvelope>(text).ok()
     }
 
-    let detail = serde_json::from_str::<ErrorBody>(text)
-        .ok()
-        .and_then(|body| body.error)
-        .and_then(|error| {
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some(error.to_string()))
-        })
+    /// The provider's own words, or the whole error object when it has none.
+    fn message(&self) -> Option<String> {
+        let error = self.error.as_ref()?;
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(error.to_string()))
+    }
+}
+
+/// Turns a non-2xx body into one readable line.
+fn describe_http_error(status: u16, text: &str) -> String {
+    let detail = ErrorEnvelope::from_text(text)
+        .and_then(|envelope| envelope.message())
         .unwrap_or_else(|| text.chars().take(300).collect());
     format!("provider returned HTTP {status}: {detail}")
 }

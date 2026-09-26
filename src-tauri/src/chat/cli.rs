@@ -111,9 +111,9 @@ impl ChatSink for CliSink {
                     let _ = std::io::stdout().flush();
                 }
             }
-            ChatEvent::Error { message, .. } => {
-                eprintln!("error: {message}");
-            }
+            // Failures also return as `Err`, so the dispatcher prints them and
+            // sets the exit code; printing here would duplicate the line.
+            ChatEvent::Error { .. } => {}
         }
     }
 }

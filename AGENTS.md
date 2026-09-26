@@ -16,7 +16,7 @@ Grove is a read-only macOS desktop viewer of working-tree changes across explici
 
 ## Key Directories
 
-- `src/components/`: application panes; `src/components/ui/`: existing Base UI/Coss-style primitives to reuse; `src/components/beautiful/`: the ported chat-primitive library (see its `ATTRIBUTION.md` — MIT, derived from Beautiful UI by Shane Levine). Do not add dependencies to use it; vendor-only behaviour was inlined on port.
+- `src/components/`: application panes; `src/components/ui/`: existing Base UI/Coss-style primitives to reuse; `src/components/beautiful/`: the ported chat-primitive library (see its `ATTRIBUTION.md` — MIT, derived from Beautiful UI by Shane Levine). Do not add dependencies to use it; vendor-only behaviour was inlined on port. It vendors styles, not the demo: only the primitives the chat renders are kept, and each renders exactly what its props say — no seeded content, no self-driven animation.
 - `src/api/`, `src/types/`: IPC boundary and its manually maintained TypeScript wire contract.
 - `src/lib/`, `src/hooks/`: shared styling helpers and React hooks.
 - `src-tauri/src/`: `config.rs` persists paths, `discovery.rs` scans directories, `git.rs` reads status/diffs and the history readers, `watch.rs` emits changes, `commands.rs` adapts IPC, `chat/` is the assistant, `cli.rs` is the subcommand surface.

@@ -15,11 +15,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::chat::prompt::system_prompt;
-use crate::chat::provider::{stream_turn, CompletedToolCall, ProviderKind, ToolSpec, TurnMessage};
-use crate::chat::tools::{run_tool, tool_specs, ToolCallRequest, ToolContext};
+use crate::chat::provider::{
+    stream_turn, CompletedToolCall, ProviderKind, StreamOutcome, ToolSpec, TurnMessage,
+};
+use crate::chat::tools::{run_tool, tool_specs, ToolCallRequest, ToolContext, ToolOutcome};
 use crate::git::read_project_status;
 
 /// The store files this module owns, relative to the data directory.
@@ -472,186 +475,315 @@ async fn run_turn(
 ) -> Result<ChatMessage, String> {
     let turn_id = request.turn_id.clone();
     let cancel = register_turn(&turn_id);
-
-    if request.text.trim().is_empty() {
-        return Err("the message was empty".to_string());
-    }
-    ensure_egress_allowed(&settings)?;
-    let stored = match projects_override {
-        Some(projects) => projects,
-        None => load_registered_projects()?,
-    };
-    let projects = dedupe_projects(&stored);
-    let api_key = match resolve_api_key(settings.provider, &settings.base_url) {
-        Ok(key) => key,
-        Err(error) => return Err(error),
-    };
-
-    let manifest = build_manifest(&projects);
-    let system = system_prompt(&manifest, &request.context);
-    let history = load_chat_history()?;
-
-    let mut messages: Vec<TurnMessage> = vec![TurnMessage::System(system)];
-    for message in &history {
-        match message.role {
-            ChatRole::User => messages.push(TurnMessage::User(message.text.clone())),
-            ChatRole::Assistant => messages.push(TurnMessage::Assistant {
-                text: message.text.clone(),
-                // Stored history keeps no tool-result payloads; replaying calls
-                // without their results would violate every provider's contract.
-                calls: Vec::new(),
-            }),
-        }
-    }
-    messages.push(TurnMessage::User(request.text.clone()));
-
-    let specs: Vec<ToolSpec> = tool_specs()
-        .into_iter()
-        .map(|(name, description, parameters)| ToolSpec {
-            name,
-            description,
-            parameters,
-        })
-        .collect();
-
-    let context = Arc::new(ToolContext {
-        projects: projects.clone(),
-    });
-
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut runs: Vec<ChatToolRun> = Vec::new();
-    let mut total_tokens: Option<u64> = None;
+    let PreparedTurn {
+        messages,
+        specs,
+        context,
+        api_key,
+    } = prepare_turn(&settings, projects_override, &request)?;
+    let mut state = TurnState::new(messages);
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".to_string());
         }
-
-        let outcome = {
-            let sink = Arc::clone(&sink);
-            let cancel_flag = Arc::clone(&cancel);
-            let turn_key = turn_id.clone();
-            stream_turn(
-                settings.provider.into(),
-                &settings.base_url,
-                &api_key,
-                &settings.model,
-                settings.max_tokens,
-                settings.temperature,
-                &messages,
-                &specs,
-                &cancel_flag,
-                &move |event| match event {
-                    provider::ProviderEvent::TextDelta(delta) => sink.emit(&ChatEvent::Delta {
-                        turn_id: turn_key.clone(),
-                        text: delta,
-                    }),
-                    provider::ProviderEvent::ReasoningDelta(delta) => {
-                        sink.emit(&ChatEvent::Reasoning {
-                            turn_id: turn_key.clone(),
-                            text: delta,
-                        })
-                    }
-                    provider::ProviderEvent::ToolCall { .. }
-                    | provider::ProviderEvent::Done { .. }
-                    | provider::ProviderEvent::Error(_) => {}
-                },
-            )
-            .await?
-        };
-
-        text.push_str(&outcome.text);
-        reasoning.push_str(&outcome.reasoning);
-        if outcome.total_tokens.is_some() {
-            total_tokens = outcome.total_tokens;
-        }
-
+        let outcome = stream_step(
+            &sink,
+            &turn_id,
+            &settings,
+            &state.messages,
+            &specs,
+            &api_key,
+            &cancel,
+        )
+        .await?;
+        state.absorb(&outcome);
         if outcome.calls.is_empty() {
             break;
         }
         if iteration + 1 == MAX_TOOL_ITERATIONS {
+            state.note_limit(outcome.calls.len(), &sink, &turn_id);
             break;
         }
-
-        messages.push(TurnMessage::Assistant {
+        state.messages.push(TurnMessage::Assistant {
             text: outcome.text.clone(),
             calls: outcome.calls.clone(),
         });
+        execute_calls(
+            &sink,
+            &turn_id,
+            &context,
+            &cancel,
+            &mut state,
+            &outcome.calls,
+        )
+        .await;
+    }
 
-        for call in outcome.calls {
-            let detail = tool_detail(&call);
-            sink.emit(&ChatEvent::Tool {
-                turn_id: turn_id.clone(),
-                tool: ChatToolRun {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    status: ChatToolStatus::Running,
-                    detail: detail.clone(),
-                    sources: Vec::new(),
-                },
-            });
+    finish_turn(sink, settings, request, state).await
+}
 
-            if cancel.load(Ordering::Relaxed) {
-                return Err("cancelled".to_string());
-            }
+/// Everything one turn needs before the first request: validated settings,
+/// history, tool specs, and the shared tool context.
+struct PreparedTurn {
+    messages: Vec<TurnMessage>,
+    specs: Vec<ToolSpec>,
+    context: Arc<ToolContext>,
+    api_key: String,
+}
 
-            let request = ToolCallRequest {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            };
-            let context = Arc::clone(&context);
-            let executed = crate::commands::blocking(move || run_tool(&context, &request)).await;
+fn prepare_turn(
+    settings: &ChatSettings,
+    projects_override: Option<Vec<String>>,
+    request: &ChatSendRequest,
+) -> Result<PreparedTurn, String> {
+    if request.text.trim().is_empty() {
+        return Err("the message was empty".to_string());
+    }
+    ensure_egress_allowed(settings)?;
+    let stored = match projects_override {
+        Some(projects) => projects,
+        None => load_registered_projects()?,
+    };
+    let projects = dedupe_projects(&stored);
+    let api_key = resolve_api_key(settings.provider, &settings.base_url)?;
 
-            let (content, sources, status) = match executed {
-                Ok(outcome) => (outcome.content, outcome.sources, ChatToolStatus::Ok),
-                Err(error) => (
-                    format!("{{\"error\": {}}}", error),
-                    Vec::new(),
-                    ChatToolStatus::Error,
-                ),
-            };
+    let manifest = build_manifest(&projects);
+    let system = system_prompt(&manifest, &request.context);
+    let history = load_chat_history()?;
+    let mut messages = replay_history(&history);
+    messages.insert(0, TurnMessage::System(system));
+    messages.push(TurnMessage::User(request.text.clone()));
 
-            sink.emit(&ChatEvent::Tool {
-                turn_id: turn_id.clone(),
-                tool: ChatToolRun {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    status,
-                    detail: detail.clone(),
-                    sources: sources.clone(),
-                },
-            });
-            runs.push(ChatToolRun {
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                status,
-                detail: detail.clone(),
-                sources,
-            });
+    Ok(PreparedTurn {
+        messages,
+        specs: tool_specs()
+            .into_iter()
+            .map(|(name, description, parameters)| ToolSpec {
+                name,
+                description,
+                parameters,
+            })
+            .collect(),
+        context: Arc::new(ToolContext {
+            projects: projects.clone(),
+        }),
+        api_key,
+    })
+}
 
-            messages.push(TurnMessage::ToolResult {
-                call_id: call.id,
-                name: call.name,
-                content,
-            });
+/// Stored history keeps no tool-result payloads, so assistant rows replay as
+/// plain text: replaying calls without their results would violate every
+/// provider's contract.
+fn replay_history(history: &[ChatMessage]) -> Vec<TurnMessage> {
+    history
+        .iter()
+        .map(|message| match message.role {
+            ChatRole::User => TurnMessage::User(message.text.clone()),
+            ChatRole::Assistant => TurnMessage::Assistant {
+                text: message.text.clone(),
+                calls: Vec::new(),
+            },
+        })
+        .collect()
+}
+
+/// Streams one model response, forwarding text and reasoning to the sink.
+#[allow(clippy::too_many_arguments)]
+async fn stream_step(
+    sink: &Arc<dyn ChatSink>,
+    turn_id: &str,
+    settings: &ChatSettings,
+    messages: &[TurnMessage],
+    specs: &[ToolSpec],
+    api_key: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<StreamOutcome, String> {
+    let sink = Arc::clone(sink);
+    let turn_key = turn_id.to_string();
+    stream_turn(
+        settings.provider.into(),
+        &settings.base_url,
+        api_key,
+        &settings.model,
+        settings.max_tokens,
+        settings.temperature,
+        messages,
+        specs,
+        cancel,
+        &move |event| match event {
+            provider::ProviderEvent::TextDelta(delta) => sink.emit(&ChatEvent::Delta {
+                turn_id: turn_key.clone(),
+                text: delta,
+            }),
+            provider::ProviderEvent::ReasoningDelta(delta) => sink.emit(&ChatEvent::Reasoning {
+                turn_id: turn_key.clone(),
+                text: delta,
+            }),
+            provider::ProviderEvent::ToolCall { .. }
+            | provider::ProviderEvent::Done { .. }
+            | provider::ProviderEvent::Error(_) => {}
+        },
+    )
+    .await
+}
+
+/// The running answer plus everything the turn accumulates.
+struct TurnState {
+    messages: Vec<TurnMessage>,
+    text: String,
+    reasoning: String,
+    runs: Vec<ChatToolRun>,
+    total_tokens: Option<u64>,
+}
+
+impl TurnState {
+    fn new(messages: Vec<TurnMessage>) -> Self {
+        TurnState {
+            messages,
+            text: String::new(),
+            reasoning: String::new(),
+            runs: Vec::new(),
+            total_tokens: None,
         }
     }
 
-    let citations = dedup_citations(&runs);
+    fn absorb(&mut self, outcome: &StreamOutcome) {
+        self.text.push_str(&outcome.text);
+        self.reasoning.push_str(&outcome.reasoning);
+        if outcome.total_tokens.is_some() {
+            self.total_tokens = outcome.total_tokens;
+        }
+    }
+
+    /// A model that hit the tool cap still asked for tools; say so instead of
+    /// silently dropping its requests.
+    fn note_limit(&mut self, pending: usize, sink: &Arc<dyn ChatSink>, turn_id: &str) {
+        let note = format!(
+            "\n\n(Stopped after {MAX_TOOL_ITERATIONS} tool rounds; {pending} requested \
+             tool call(s) were not run.)"
+        );
+        sink.emit(&ChatEvent::Delta {
+            turn_id: turn_id.to_string(),
+            text: note.clone(),
+        });
+        self.text.push_str(&note);
+    }
+}
+
+/// Runs every tool call the model asked for, appending results to the messages.
+/// A failed tool reports its error to the model and the panel, and the turn goes on.
+async fn execute_calls(
+    sink: &Arc<dyn ChatSink>,
+    turn_id: &str,
+    context: &Arc<ToolContext>,
+    cancel: &Arc<AtomicBool>,
+    state: &mut TurnState,
+    calls: &[CompletedToolCall],
+) {
+    for call in calls {
+        let running = ChatToolRun {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            status: ChatToolStatus::Running,
+            detail: tool_detail(call),
+            sources: Vec::new(),
+        };
+        sink.emit(&ChatEvent::Tool {
+            turn_id: turn_id.to_string(),
+            tool: running.clone(),
+        });
+        if cancel.load(Ordering::Relaxed) {
+            state.runs.push(running);
+            return;
+        }
+
+        let request = ToolCallRequest {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        };
+        let tool_context = Arc::clone(context);
+        let executed = crate::commands::blocking(move || run_tool(&tool_context, &request)).await;
+
+        let finished = finish_tool_run(&running, executed);
+        sink.emit(&ChatEvent::Tool {
+            turn_id: turn_id.to_string(),
+            tool: finished.run.clone(),
+        });
+        state.runs.push(finished.run.clone());
+        state.messages.push(TurnMessage::ToolResult {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            content: finished.content,
+        });
+    }
+}
+
+/// A completed run plus the bounded text the model sees.
+struct FinishedToolRun {
+    run: ChatToolRun,
+    content: String,
+}
+
+fn finish_tool_run(
+    running: &ChatToolRun,
+    executed: Result<ToolOutcome, String>,
+) -> FinishedToolRun {
+    let (content, sources, status) = match executed {
+        Ok(outcome) => (
+            cap_tool_result(outcome.content),
+            outcome.sources,
+            ChatToolStatus::Ok,
+        ),
+        Err(error) => (error_payload(&error), Vec::new(), ChatToolStatus::Error),
+    };
+    FinishedToolRun {
+        run: ChatToolRun {
+            call_id: running.call_id.clone(),
+            name: running.name.clone(),
+            status,
+            detail: running.detail.clone(),
+            sources,
+        },
+        content,
+    }
+}
+
+/// Tool errors travel as valid JSON so the provider always parses the result.
+fn error_payload(error: &str) -> String {
+    serde_json::to_string(&json!({ "error": error })).unwrap_or_else(|_| {
+        "{\"error\": \"the tool failed and its error could not be serialized\"}".to_string()
+    })
+}
+
+/// Nothing a tool read may exceed the text bound, even if a reader regresses.
+fn cap_tool_result(content: String) -> String {
+    let bound = crate::git::MAX_TEXT_SIDE_BYTES as usize;
+    if content.len() <= bound {
+        return content;
+    }
+    format!("{{\"truncated\": true, \"note\": \"tool result exceeded {bound} bytes and was cut\"}}")
+}
+
+/// Builds the final assistant message, persists the pair, and reports `Done`.
+async fn finish_turn(
+    sink: Arc<dyn ChatSink>,
+    settings: ChatSettings,
+    request: ChatSendRequest,
+    state: TurnState,
+) -> Result<ChatMessage, String> {
     let message = ChatMessage {
-        id: new_message_id(&text),
+        id: new_message_id(&state.text),
         role: ChatRole::Assistant,
-        text,
-        reasoning,
-        tools: runs,
-        citations,
+        text: state.text,
+        reasoning: state.reasoning,
+        tools: state.runs.clone(),
+        citations: dedup_citations(&state.runs),
         model: Some(settings.model.clone()),
         created_at: now_millis(),
         error: None,
     };
-
     append_chat_history(&[
         ChatMessage {
             id: new_message_id(&request.text),
@@ -666,11 +798,10 @@ async fn run_turn(
         },
         message.clone(),
     ])?;
-
     sink.emit(&ChatEvent::Done {
-        turn_id,
+        turn_id: request.turn_id,
         message: Box::new(message.clone()),
-        total_tokens,
+        total_tokens: state.total_tokens,
     });
     Ok(message)
 }

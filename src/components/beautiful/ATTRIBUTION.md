@@ -8,18 +8,23 @@ interface primitives for AI-native products" — by Shane Levine.
 
 ## What changed in the port
 
-The components are otherwise faithful copies, including prop names and export names, so diffs
-against upstream stay readable. The following substitutions were required to run inside
-Grove's Vite/React 19/Tailwind 4 app without adding dependencies:
+Only the primitives the chat renders are vendored, and they are **styles, not behaviour**: each
+one renders exactly the props it is given — no seeded demo content, no self-driven animation or
+timers, and no vendor copy. Prop and export names are kept so diffs against upstream stay
+readable.
+
+Substitutions required to run inside Grove's Vite/React 19/Tailwind 4 app without adding
+dependencies:
 
 | Upstream dependency | Replacement here |
 | --- | --- |
-| `@central-icons-react` (commercial icon set, used by `SidebarNav`) | `lucide-react` (already a Grove dependency) |
-| `iconoir-react` (used by `SelectionActions`) | `lucide-react` |
 | `glimm` (canvas sweep effect in `PromptBar`) | inlined canvas-2D sweep, same trigger and ref, honours `prefers-reduced-motion` |
-| `liveline` (sparkline in `InsightCards`) | inlined SVG line chart with the same prop surface; static snapshots are faithful, live streaming and momentum are inert |
 | `shadow-plugin` (CSS shadow scale) | inlined layered `oklch` shadow stacks in `src/index.css` |
 | `@web-kits/audio` | not ported; only used by the upstream demo site |
+
+Components the app does not render are not vendored, along with their demo-only dependencies
+(`@central-icons-react` for `SidebarNav`, `iconoir-react` for `SelectionActions`, `liveline` for
+`InsightCards`).
 
 Design tokens were merged additively into `src/index.css`; Grove's existing token values are not
 overridden and Tailwind is not re-imported.

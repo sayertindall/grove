@@ -162,176 +162,199 @@ pub fn tool_specs() -> Vec<(String, String, Value)> {
     ]
 }
 
+/// One tool's parsed arguments. Unknown fields are ignored; malformed JSON is a
+/// readable error, never a guess.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ToolArgs {
+    project: Option<String>,
+    file: Option<String>,
+    view: Option<String>,
+    query: Option<String>,
+    limit: Option<u32>,
+    #[serde(rename = "startLine")]
+    start_line: Option<u32>,
+    #[serde(rename = "endLine")]
+    end_line: Option<u32>,
+}
+
+fn parse_args(call: &ToolCallRequest) -> Result<ToolArgs, String> {
+    if call.arguments.trim().is_empty() {
+        return Ok(ToolArgs::default());
+    }
+    serde_json::from_str(&call.arguments)
+        .map_err(|error| format!("{}: invalid arguments: {error}", call.name))
+}
+
+/// The diff view the model asked for. An unrecognized value is rejected, not
+/// silently read as `head`.
+fn parse_view(view: Option<&str>) -> Result<DiffView, String> {
+    match view {
+        None | Some("head") => Ok(DiffView::Head),
+        Some("staged") => Ok(DiffView::Staged),
+        Some("unstaged") => Ok(DiffView::Unstaged),
+        Some(other) => Err(format!(
+            "read_diff: unknown view `{other}` (expected head, staged, or unstaged)"
+        )),
+    }
+}
+
 /// Runs one tool call. Every failure is a readable string, never a panic.
 pub fn run_tool(context: &ToolContext, call: &ToolCallRequest) -> Result<ToolOutcome, String> {
-    #[derive(Deserialize, Default)]
-    #[serde(default)]
-    struct Args {
-        project: Option<String>,
-        file: Option<String>,
-        view: Option<String>,
-        query: Option<String>,
-        limit: Option<u32>,
-        #[serde(rename = "startLine")]
-        start_line: Option<u32>,
-        #[serde(rename = "endLine")]
-        end_line: Option<u32>,
-    }
-
-    let args: Args = if call.arguments.trim().is_empty() {
-        Args::default()
-    } else {
-        serde_json::from_str(&call.arguments)
-            .map_err(|error| format!("{}: invalid arguments: {error}", call.name))?
-    };
-
+    let args = parse_args(call)?;
     match call.name.as_str() {
-        "list_projects" => {
-            let rows: Vec<Value> = context
-                .projects
-                .iter()
-                .map(|path| serde_json::to_value(read_project_status(path)).unwrap_or(Value::Null))
-                .collect();
-            let project = context.projects.first().cloned().unwrap_or_default();
-            Ok(ToolOutcome {
-                content: bounded_json(json!({ "projects": rows }))?,
-                sources: (!project.is_empty())
-                    .then(|| citation(&project, None, None, None))
-                    .into_iter()
-                    .collect(),
-            })
-        }
-        "list_changes" => {
-            let project = resolve_project(context, required(&args.project, "project")?)?;
-            let changes = read_project_changes(&project, false)?;
-            Ok(ToolOutcome {
-                content: bounded_json(
-                    serde_json::to_value(&changes).map_err(|error| error.to_string())?,
-                )?,
-                sources: vec![citation(&project, None, None, None)],
-            })
-        }
-        "read_diff" => {
-            let project = resolve_project(context, required(&args.project, "project")?)?;
-            let file = required(&args.file, "file")?;
-            let relative = resolve_file(&project, file)?;
-            let view = match args.view.as_deref() {
-                Some("staged") => DiffView::Staged,
-                Some("unstaged") => DiffView::Unstaged,
-                _ => DiffView::Head,
-            };
-            let diff = read_file_diff(&project, &relative, view, false)?;
-            let sources = vec![citation(&project, Some(&relative), Some(1), Some(u32::MAX))];
-            Ok(ToolOutcome {
-                content: bounded_json(
-                    serde_json::to_value(&diff).map_err(|error| error.to_string())?,
-                )?,
-                sources,
-            })
-        }
-        "read_file" => {
-            let project = resolve_project(context, required(&args.project, "project")?)?;
-            let file = required(&args.file, "file")?;
-            let relative = resolve_file(&project, file)?;
-            let full = Path::new(&project).join(&relative);
-            let metadata =
-                std::fs::metadata(&full).map_err(|error| format!("{relative}: {error}"))?;
-            if !metadata.is_file() {
-                return Err(format!("{relative}: not a file"));
-            }
-            let (contents, truncated) = read_bounded(&full)?;
-            let source = citation(&project, Some(&relative), None, None);
-            Ok(ToolOutcome {
-                content: bounded_json(json!({
-                    "path": relative,
-                    "truncated": truncated,
-                    "contents": contents,
-                }))?,
-                sources: vec![source],
-            })
-        }
-        "search_changes" => {
-            let query = required(&args.query, "query")?;
-            let mut matches = Vec::new();
-            let mut sources = Vec::new();
-            let projects: Vec<String> = match &args.project {
-                Some(path) => vec![resolve_project(context, path)?],
-                None => context.projects.clone(),
-            };
-            for project in &projects {
-                if matches.len() >= MAX_SEARCH_MATCHES {
-                    break;
-                }
-                let found =
-                    search_changed_files(project, query, MAX_SEARCH_MATCHES - matches.len())?;
-                for hit in found {
-                    sources.push(citation(
-                        project,
-                        Some(&hit.file),
-                        Some(hit.line),
-                        Some(hit.line),
-                    ));
-                    matches.push(serde_json::to_value(&hit).unwrap_or(Value::Null));
-                }
-            }
-            Ok(ToolOutcome {
-                content: bounded_json(json!({ "matches": matches, "count": matches.len() }))?,
-                sources,
-            })
-        }
-        "list_worktrees" => {
-            let project = resolve_project(context, required(&args.project, "project")?)?;
-            let worktrees = read_worktrees(&project)?;
-            Ok(ToolOutcome {
-                content: bounded_json(json!({ "worktrees": worktrees }))?,
-                sources: vec![citation(&project, None, None, None)],
-            })
-        }
-        "recent_commits" => {
-            let project = resolve_project(context, required(&args.project, "project")?)?;
-            let limit = clamp_limit(args.limit);
-            let commits = read_recent_commits(&project, limit)?;
-            Ok(ToolOutcome {
-                content: bounded_json(json!({ "commits": commits, "count": commits.len() }))?,
-                sources: vec![citation(&project, None, None, None)],
-            })
-        }
-        "file_history" => {
-            let project = resolve_project(context, required(&args.project, "project")?)?;
-            let file = required(&args.file, "file")?;
-            let relative = resolve_file(&project, file)?;
-            let limit = clamp_limit(args.limit);
-            let commits = read_file_history(&project, &relative, limit)?;
-            Ok(ToolOutcome {
-                content: bounded_json(json!({ "file": relative, "commits": commits }))?,
-                sources: vec![citation(&project, Some(&relative), None, None)],
-            })
-        }
-        "blame" => {
-            let project = resolve_project(context, required(&args.project, "project")?)?;
-            let file = required(&args.file, "file")?;
-            let relative = resolve_file(&project, file)?;
-            let blame = read_blame(&project, &relative, args.start_line, args.end_line)?;
-            let start = args
-                .start_line
-                .or_else(|| blame.first().map(|row| row.line));
-            let end = args
-                .end_line
-                .or_else(|| blame.last().map(|row| row.line))
-                .or(start);
-            Ok(ToolOutcome {
-                content: bounded_json(json!({
-                    "file": relative,
-                    "truncated": blame.len() >= MAX_BLAME_LINES,
-                    "lines": blame,
-                }))?,
-                sources: vec![citation(&project, Some(&relative), start, end)],
-            })
-        }
+        "list_projects" => list_projects(context),
+        "list_changes" => list_changes(context, &args),
+        "read_diff" => read_diff(context, &args),
+        "read_file" => read_file(context, &args),
+        "search_changes" => search_changes(context, &args),
+        "list_worktrees" => list_worktrees(context, &args),
+        "recent_commits" => recent_commits(context, &args),
+        "file_history" => file_history(context, &args),
+        "blame" => blame(context, &args),
         other => Err(format!(
             "{other}: unknown tool; the available tools are listed in the system prompt"
         )),
     }
+}
+
+fn list_projects(context: &ToolContext) -> Result<ToolOutcome, String> {
+    let rows: Vec<Value> = context
+        .projects
+        .iter()
+        .map(|path| serde_json::to_value(read_project_status(path)).unwrap_or(Value::Null))
+        .collect();
+    let project = context.projects.first().cloned().unwrap_or_default();
+    Ok(ToolOutcome {
+        content: bounded_json(json!({ "projects": rows }))?,
+        sources: (!project.is_empty())
+            .then(|| citation(&project, None, None, None))
+            .into_iter()
+            .collect(),
+    })
+}
+
+fn list_changes(context: &ToolContext, args: &ToolArgs) -> Result<ToolOutcome, String> {
+    let project = resolve_project(context, required(&args.project, "project")?)?;
+    let changes = read_project_changes(&project, false)?;
+    Ok(ToolOutcome {
+        content: bounded_json(serde_json::to_value(&changes).map_err(|error| error.to_string())?)?,
+        sources: vec![citation(&project, None, None, None)],
+    })
+}
+
+fn read_diff(context: &ToolContext, args: &ToolArgs) -> Result<ToolOutcome, String> {
+    let project = resolve_project(context, required(&args.project, "project")?)?;
+    let file = required(&args.file, "file")?;
+    let relative = resolve_file(&project, file)?;
+    let view = parse_view(args.view.as_deref())?;
+    let diff = read_file_diff(&project, &relative, view, false)?;
+    let sources = vec![citation(&project, Some(&relative), Some(1), Some(u32::MAX))];
+    Ok(ToolOutcome {
+        content: bounded_json(serde_json::to_value(&diff).map_err(|error| error.to_string())?)?,
+        sources,
+    })
+}
+
+fn read_file(context: &ToolContext, args: &ToolArgs) -> Result<ToolOutcome, String> {
+    let project = resolve_project(context, required(&args.project, "project")?)?;
+    let file = required(&args.file, "file")?;
+    let relative = resolve_file(&project, file)?;
+    let full = Path::new(&project).join(&relative);
+    let metadata = std::fs::metadata(&full).map_err(|error| format!("{relative}: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{relative}: not a file"));
+    }
+    let (contents, truncated) = read_bounded(&full)?;
+    Ok(ToolOutcome {
+        content: bounded_json(json!({
+            "path": relative,
+            "truncated": truncated,
+            "contents": contents,
+        }))?,
+        sources: vec![citation(&project, Some(&relative), None, None)],
+    })
+}
+
+fn search_changes(context: &ToolContext, args: &ToolArgs) -> Result<ToolOutcome, String> {
+    let query = required(&args.query, "query")?;
+    let projects: Vec<String> = match &args.project {
+        Some(path) => vec![resolve_project(context, path)?],
+        None => context.projects.clone(),
+    };
+    let mut matches = Vec::new();
+    let mut sources = Vec::new();
+    for project in &projects {
+        if matches.len() >= MAX_SEARCH_MATCHES {
+            break;
+        }
+        let found = search_changed_files(project, query, MAX_SEARCH_MATCHES - matches.len())?;
+        for hit in found {
+            sources.push(citation(
+                project,
+                Some(&hit.file),
+                Some(hit.line),
+                Some(hit.line),
+            ));
+            matches.push(serde_json::to_value(&hit).unwrap_or(Value::Null));
+        }
+    }
+    Ok(ToolOutcome {
+        content: bounded_json(json!({ "matches": matches, "count": matches.len() }))?,
+        sources,
+    })
+}
+
+fn list_worktrees(context: &ToolContext, args: &ToolArgs) -> Result<ToolOutcome, String> {
+    let project = resolve_project(context, required(&args.project, "project")?)?;
+    let worktrees = read_worktrees(&project)?;
+    Ok(ToolOutcome {
+        content: bounded_json(json!({ "worktrees": worktrees }))?,
+        sources: vec![citation(&project, None, None, None)],
+    })
+}
+
+fn recent_commits(context: &ToolContext, args: &ToolArgs) -> Result<ToolOutcome, String> {
+    let project = resolve_project(context, required(&args.project, "project")?)?;
+    let limit = clamp_limit(args.limit);
+    let commits = read_recent_commits(&project, limit)?;
+    Ok(ToolOutcome {
+        content: bounded_json(json!({ "commits": commits, "count": commits.len() }))?,
+        sources: vec![citation(&project, None, None, None)],
+    })
+}
+
+fn file_history(context: &ToolContext, args: &ToolArgs) -> Result<ToolOutcome, String> {
+    let project = resolve_project(context, required(&args.project, "project")?)?;
+    let file = required(&args.file, "file")?;
+    let relative = resolve_file(&project, file)?;
+    let commits = read_file_history(&project, &relative, clamp_limit(args.limit))?;
+    Ok(ToolOutcome {
+        content: bounded_json(json!({ "file": relative, "commits": commits }))?,
+        sources: vec![citation(&project, Some(&relative), None, None)],
+    })
+}
+
+fn blame(context: &ToolContext, args: &ToolArgs) -> Result<ToolOutcome, String> {
+    let project = resolve_project(context, required(&args.project, "project")?)?;
+    let file = required(&args.file, "file")?;
+    let relative = resolve_file(&project, file)?;
+    let blame = read_blame(&project, &relative, args.start_line, args.end_line)?;
+    let start = args
+        .start_line
+        .or_else(|| blame.first().map(|row| row.line));
+    let end = args
+        .end_line
+        .or_else(|| blame.last().map(|row| row.line))
+        .or(start);
+    Ok(ToolOutcome {
+        content: bounded_json(json!({
+            "file": relative,
+            "truncated": blame.len() >= MAX_BLAME_LINES,
+            "lines": blame,
+        }))?,
+        sources: vec![citation(&project, Some(&relative), start, end)],
+    })
 }
 
 fn required<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {

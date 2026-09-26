@@ -10,11 +10,17 @@ import {
   LoadingState,
   PromptBar,
   Shimmer,
-  StreamingText,
   ThinkingState,
   ToolChips,
   ValuePill,
 } from "@/components/beautiful";
+import {
+  inlineText,
+  parseMarkdownBlocks,
+  type Block,
+  type InlineToken,
+  type TableAlign,
+} from "@/lib/markdown";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
@@ -75,7 +81,22 @@ function parseFences(text: string): Segment[] {
     segments.push({ kind: "code", lang: match[1] ?? "", code: match[2] ?? "" });
     last = start + match[0].length;
   }
-  if (last < text.length) segments.push({ kind: "text", text: text.slice(last) });
+  if (last < text.length) {
+    // A fence still open mid-stream renders as code already, so closing it later never jumps layout.
+    const openIndex = text.indexOf("```", last);
+    if (openIndex !== -1) {
+      if (openIndex > last) segments.push({ kind: "text", text: text.slice(last, openIndex) });
+      const rest = text.slice(openIndex + 3);
+      const newline = rest.indexOf("\n");
+      segments.push({
+        kind: "code",
+        lang: newline === -1 ? rest : rest.slice(0, newline),
+        code: newline === -1 ? "" : rest.slice(newline + 1),
+      });
+      return segments;
+    }
+    segments.push({ kind: "text", text: text.slice(last) });
+  }
   return segments;
 }
 
@@ -340,6 +361,187 @@ function CitationChips({
   );
 }
 
+/** Inline markdown with citations clickable when the merged citation row knows the label. */
+function InlineRun({
+  tokens,
+  citations,
+  onCitationClick,
+}: {
+  tokens: InlineToken[];
+  citations: Map<string, ChatCitation>;
+  onCitationClick: (citation: ChatCitation) => void;
+}) {
+  return tokens.map((token, index) => {
+    if (token.kind === "text") return <span key={index}>{token.text}</span>;
+    if (token.kind === "code")
+      return (
+        <code key={index} className="rounded bg-field px-1 py-0.5 font-mono text-[11.5px]">
+          {token.text}
+        </code>
+      );
+    if (token.kind === "bold")
+      return (
+        <strong key={index} className="font-semibold">
+          <InlineRun
+            tokens={token.children}
+            citations={citations}
+            onCitationClick={onCitationClick}
+          />
+        </strong>
+      );
+    if (token.kind === "italic")
+      return (
+        <em key={index}>
+          <InlineRun
+            tokens={token.children}
+            citations={citations}
+            onCitationClick={onCitationClick}
+          />
+        </em>
+      );
+    const citation = citations.get(token.label);
+    if (citation === undefined)
+      return (
+        <span key={index} className="font-mono text-[11.5px]">
+          {token.label}
+        </span>
+      );
+    return (
+      <button
+        key={index}
+        type="button"
+        title={`Show ${token.label} in the diff pane`}
+        className="rounded px-0.5 font-mono text-[11.5px] text-accent underline decoration-dotted transition-opacity duration-100 hover:opacity-85"
+        onClick={() => onCitationClick(citation)}
+      >
+        {token.label}
+      </button>
+    );
+  });
+}
+
+const HEADING_CLASS: Record<number, string> = {
+  1: "text-[15px] font-semibold",
+  2: "text-[14px] font-semibold",
+  3: "text-[13px] font-semibold",
+  4: "text-[12.5px] font-semibold",
+  5: "text-[12.5px] font-medium",
+  6: "text-[12.5px] font-medium",
+};
+
+const ALIGN_CLASS: Record<TableAlign, string> = {
+  left: "text-left",
+  center: "text-center",
+  right: "text-right",
+};
+
+function MarkdownBlock({
+  block,
+  citations,
+  onCitationClick,
+}: {
+  block: Block;
+  citations: Map<string, ChatCitation>;
+  onCitationClick: (citation: ChatCitation) => void;
+}) {
+  const inline = (tokens: InlineToken[]) => (
+    <InlineRun tokens={tokens} citations={citations} onCitationClick={onCitationClick} />
+  );
+  switch (block.kind) {
+    case "heading":
+      return <p className={HEADING_CLASS[block.level]}>{inline(block.children)}</p>;
+    case "paragraph":
+      return <p>{inline(block.children)}</p>;
+    case "list": {
+      const items = block.items.map((item, index) => (
+        <li key={index} className="pl-1">
+          {inline(item)}
+        </li>
+      ));
+      return block.ordered ? (
+        <ol className="list-decimal space-y-0.5 pl-5" start={block.start}>
+          {items}
+        </ol>
+      ) : (
+        <ul className="list-disc space-y-0.5 pl-5">{items}</ul>
+      );
+    }
+    case "blockquote":
+      return (
+        <blockquote className="border-l-2 border-border pl-2 text-ink-2">
+          {block.blocks.map((nested, index) => (
+            <MarkdownBlock
+              key={index}
+              block={nested}
+              citations={citations}
+              onCitationClick={onCitationClick}
+            />
+          ))}
+        </blockquote>
+      );
+    case "rule":
+      return <hr className="border-border" />;
+    case "table":
+      return (
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse text-left text-[11.5px]">
+            <thead>
+              <tr>
+                {block.aligns.map((align, index) => (
+                  <th
+                    key={index}
+                    className={`border-b border-border px-1.5 py-1 font-medium ${ALIGN_CLASS[align]}${inlineText(block.header[index] ?? []).length <= 18 ? " whitespace-nowrap" : ""}`}
+                  >
+                    {inline(block.header[index] ?? [])}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {block.rows.map((row, rowIndex) => (
+                <tr key={rowIndex} className="border-b border-border/60 last:border-b-0">
+                  {block.aligns.map((align, columnIndex) => (
+                    <td
+                      key={columnIndex}
+                      className={`px-1.5 py-1 align-top ${ALIGN_CLASS[align]}${inlineText(row[columnIndex] ?? []).length <= 18 ? " whitespace-nowrap" : ""}`}
+                    >
+                      {inline(row[columnIndex] ?? [])}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+  }
+}
+
+/** The growing answer text, announced politely while the turn streams. */
+function MarkdownAnswer({
+  text,
+  citations,
+  onCitationClick,
+}: {
+  text: string;
+  citations: Map<string, ChatCitation>;
+  onCitationClick: (citation: ChatCitation) => void;
+}) {
+  const blocks = useMemo(() => parseMarkdownBlocks(text), [text]);
+  return (
+    <div className="flex flex-col gap-2 text-[12.5px] leading-relaxed text-ink">
+      {blocks.map((block, index) => (
+        <MarkdownBlock
+          key={`${block.kind}-${index}`}
+          block={block}
+          citations={citations}
+          onCitationClick={onCitationClick}
+        />
+      ))}
+    </div>
+  );
+}
+
 function AssistantAnswer({
   message,
   isActive,
@@ -352,6 +554,9 @@ function AssistantAnswer({
   onCitationClick: (citation: ChatCitation) => void;
 }) {
   const segments = useMemo(() => parseFences(message.text), [message.text]);
+  const waiting =
+    isActive && message.text === "" && message.reasoning === "" && message.tools.length === 0;
+
   const inlineCitations = useMemo(() => {
     const found: ChatCitation[] = [];
     for (const segment of segments) {
@@ -377,11 +582,31 @@ function AssistantAnswer({
     );
   }, [segments, message.citations, context.projectPath]);
 
-  const waiting =
-    isActive && message.text === "" && message.reasoning === "" && message.tools.length === 0;
+  /** One deduplicated chip row: tool-derived citations first, inline-only ones after. */
+  const mergedCitations = useMemo(() => {
+    const merged = [...message.citations];
+    for (const citation of inlineCitations) {
+      if (!merged.some((known) => known.label === citation.label)) merged.push(citation);
+    }
+    return merged;
+  }, [message.citations, inlineCitations]);
+
+  const citationsByLabel = useMemo(
+    () => new Map(mergedCitations.map((citation) => [citation.label, citation])),
+    [mergedCitations],
+  );
+
+  const keyedSegments = useMemo(() => {
+    let textCount = 0;
+    let codeCount = 0;
+    return segments.map((segment) => ({
+      segment,
+      key: segment.kind === "text" ? `text-${textCount++}` : `code-${codeCount++}`,
+    }));
+  }, [segments]);
 
   return (
-    <div className="flex flex-col gap-2">
+    <div role="group" aria-label="Assistant answer" className="flex flex-col gap-2">
       {message.reasoning !== "" && (
         <ThinkingState
           variant="Reasoning"
@@ -407,27 +632,30 @@ function AssistantAnswer({
           The turn ended without an answer. Nothing was guessed; try asking again.
         </p>
       ) : (
-        segments.map((segment, index) =>
+        keyedSegments.map(({ segment, key }) =>
           segment.kind === "text" ? (
-            <StreamingText
-              key={index}
-              fill
-              loop={false}
-              content={segment.text.match(/\S+\s*/g)?.map((token) => ({ text: token })) ?? []}
-              sources={[]}
-              followUps={[]}
-              labels={{ sources: "", followUps: "" }}
+            <MarkdownAnswer
+              key={key}
+              text={segment.text}
+              citations={citationsByLabel}
+              onCitationClick={(citation) =>
+                onCitationClick(
+                  citation.filePath === null && context.projectPath !== null
+                    ? { ...citation, projectPath: context.projectPath }
+                    : citation,
+                )
+              }
             />
           ) : segment.lang.startsWith("diff") ? (
             <CodeBlock
-              key={index}
+              key={key}
               variant="Diff"
               filename={`${segment.lang} patch`}
               diff={parseDiffRows(segment.code)}
             />
           ) : (
             <CodeBlock
-              key={index}
+              key={key}
               variant="Code"
               filename={segment.lang === "" ? "code" : segment.lang}
               lines={segment.code.replace(/\n$/, "").split("\n")}
@@ -441,19 +669,10 @@ function AssistantAnswer({
         </p>
       )}
       <CitationChips
-        citations={message.citations}
+        citations={mergedCitations}
         fallbackProject={context.projectPath}
         onCitationClick={onCitationClick}
       />
-      {inlineCitations.length > 0 && (
-        <CitationChips
-          citations={inlineCitations.filter(
-            (citation) => !message.citations.some((known) => known.label === citation.label),
-          )}
-          fallbackProject={context.projectPath}
-          onCitationClick={onCitationClick}
-        />
-      )}
       {message.model !== null && <span className="text-[11px] text-ink-3">{message.model}</span>}
     </div>
   );
@@ -535,10 +754,32 @@ export default function ChatPanel({
     if (node !== null) node.scrollTop = 0;
   }, [settingsOpen]);
 
+  /** Follow the answer only while the reader is already at the bottom. */
+  const [atBottom, setAtBottom] = useState(true);
+  const pinnedRef = useRef(true);
+
   useEffect(() => {
     const node = scrollRef.current;
-    if (node !== null) node.scrollTop = node.scrollHeight;
+    if (node === null) return;
+    const onScroll = () => {
+      const pinned = node.scrollTop + node.clientHeight >= node.scrollHeight - 48;
+      pinnedRef.current = pinned;
+      setAtBottom(pinned);
+    };
+    node.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => node.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (node !== null && pinnedRef.current) node.scrollTop = node.scrollHeight;
   }, [stream.messages, stream.activeTurnId]);
+
+  const scrollToLatest = () => {
+    const node = scrollRef.current;
+    if (node !== null) node.scrollTop = node.scrollHeight;
+  };
 
   const providerReady = settings !== null && settings.baseUrl !== "" && settings.model !== "";
   const egressNeedsAck =
@@ -585,7 +826,7 @@ export default function ChatPanel({
       title: "Current project",
       chars: context.projectPath ?? "none selected",
       body: "Changes, diffs, file contents, history, and blame for the project selected in Grove.",
-      source: context.projectPath === null ? "Nothing selected" : "Grove selection",
+      source: context.projectPath === null ? "Nothing selected" : "Sidebar",
       badge: "GIT",
       tone: "bg-accent",
     },
@@ -603,6 +844,12 @@ export default function ChatPanel({
     <aside
       aria-label="Chat"
       className="flex min-h-0 shrink-0 flex-col border-l border-border bg-background"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && stream.activeTurnId !== null) {
+          event.preventDefault();
+          stream.cancel();
+        }
+      }}
       style={{ width }}
     >
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border px-3">
@@ -650,7 +897,13 @@ export default function ChatPanel({
         </Button>
       </div>
 
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+      <div
+        ref={scrollRef}
+        role="log"
+        aria-live="polite"
+        aria-busy={stream.activeTurnId !== null}
+        className="min-h-0 flex-1 overflow-y-auto px-3 py-3"
+      >
         {settingsOpen && settings !== null && (
           <div className="mb-3">
             <ChatSettingsForm
@@ -704,7 +957,12 @@ export default function ChatPanel({
           <div className="flex flex-col gap-4">
             {stream.messages.map((message) =>
               message.role === "user" ? (
-                <div key={message.id} className="flex justify-end">
+                <div
+                  key={message.id}
+                  role="group"
+                  aria-label="Your question"
+                  className="flex justify-end"
+                >
                   <p className="max-w-[90%] rounded-card bg-field px-2.5 py-1.5 text-[12.5px] text-ink shadow-hairline">
                     {message.text}
                   </p>
@@ -722,6 +980,14 @@ export default function ChatPanel({
           </div>
         )}
       </div>
+
+      {!atBottom && stream.messages.length > 0 && (
+        <div className="flex shrink-0 justify-center pb-1">
+          <Button size="sm" variant="outline" onClick={scrollToLatest}>
+            Latest
+          </Button>
+        </div>
+      )}
 
       <div className="shrink-0 border-t border-border px-3 py-2.5">
         {egressNeedsAck && pendingSend !== null && settings !== null && (
@@ -756,25 +1022,24 @@ export default function ChatPanel({
             />
           </div>
         )}
-        {stream.activeTurnId !== null ? (
-          <div className="flex items-center justify-between gap-2">
+        {stream.activeTurnId !== null && (
+          <div className="mb-2 flex items-center justify-between gap-2">
             <LoadingState label="Working" variant="Drive" />
             <Button size="sm" variant="outline" onClick={stream.cancel}>
               Stop
             </Button>
           </div>
-        ) : (
-          <PromptBar
-            placeholder={
-              providerReady && hasKey !== false
-                ? "Ask about this workspace's changes…"
-                : hasKey === false
-                  ? "Add an API key in settings to start chatting"
-                  : "Configure the provider to start chatting"
-            }
-            onSend={handleSend}
-          />
         )}
+        <PromptBar
+          placeholder={
+            providerReady && hasKey !== false
+              ? "Ask about this workspace's changes…"
+              : hasKey === false
+                ? "Add an API key in settings to start chatting"
+                : "Configure the provider to start chatting"
+          }
+          onSend={handleSend}
+        />
       </div>
     </aside>
   );

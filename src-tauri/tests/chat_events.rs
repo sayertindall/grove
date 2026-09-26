@@ -360,3 +360,145 @@ fn a_provider_failure_settles_the_turn_instead_of_hanging() {
         "a refused turn persists nothing: {stored:#?}"
     );
 }
+
+/// Answers one request with an exact response body, byte for byte.
+fn serve_raw(response: String) -> Stub {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let saw_request = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&saw_request);
+    let finished = std::thread::spawn(move || {
+        let Some(mut stream) = accept_before_deadline(&listener) else {
+            return;
+        };
+        let _ = read_request(&stream);
+        seen.store(true, Ordering::Relaxed);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+    Stub {
+        base_url: format!("http://127.0.0.1:{port}"),
+        saw_request,
+        finished,
+    }
+}
+
+fn sse_head() -> &'static str {
+    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+}
+
+fn plain_json_head() -> &'static str {
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+}
+
+/// Waits for the turn to settle and returns its final error payload. A
+/// mid-stream failure may legitimately arrive after partial deltas.
+fn error_event(receiver: &mpsc::Receiver<(String, Value)>) -> Value {
+    let events = drain_until_settled(receiver);
+    let last = events.last().expect("the turn settles with an event");
+    assert_eq!(
+        last.0, "grove://chat-error",
+        "the turn fails once: {events:#?}"
+    );
+    assert_eq!(last.1["kind"].as_str(), Some("error"));
+    assert_eq!(last.1["retryable"].as_bool(), Some(false));
+    last.1.clone()
+}
+
+#[test]
+fn sse_frames_parse_across_crlf_multiline_and_unterminated_done() {
+    let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    isolate_store();
+
+    // CRLF terminators, one JSON frame spread over several `data:` lines, and
+    // a `[DONE]` with no trailing newline after it.
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\r\n",
+        "\r\n",
+        "data: {\r\n",
+        "data: \"choices\": [{\"delta\": {\"content\": \"b\"}}]\r\n",
+        "data: }\r\n",
+        "\r\n",
+        "data: [DONE]\n"
+    );
+    let stub = serve_raw(format!("{}{body}", sse_head()));
+    settings_for(stub.base_url.clone());
+
+    let app = mock_app();
+    let receiver = collect(&app);
+    start_turn(&app, "turn-crlf", "say hello");
+    let events = drain_until_settled(&receiver);
+    finish_stub(stub);
+
+    let text: String = events
+        .iter()
+        .filter(|(channel, _)| channel == "grove://chat-delta")
+        .filter_map(|(_, payload)| payload["text"].as_str())
+        .collect();
+    assert_eq!(
+        text, "ab",
+        "both frames must arrive, whatever the line endings: {events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(channel, _)| channel == "grove://chat-done"),
+        "an unterminated [DONE] still ends the turn: {events:#?}"
+    );
+}
+
+#[test]
+fn a_provider_error_frame_mid_stream_fails_the_turn_readably() {
+    let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    isolate_store();
+
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n",
+        "\n",
+        "data: {\"error\":{\"message\":\"quota exceeded\"}}\n",
+        "\n",
+        "data: [DONE]\n\n",
+    );
+    let stub = serve_raw(format!("{}{body}", sse_head()));
+    settings_for(stub.base_url.clone());
+
+    let app = mock_app();
+    let receiver = collect(&app);
+    start_turn(&app, "turn-errframe", "say hello");
+    let payload = error_event(&receiver);
+    finish_stub(stub);
+
+    assert_eq!(payload["turnId"].as_str(), Some("turn-errframe"));
+    let message = payload["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("quota exceeded"),
+        "the provider's own words survive: {message}"
+    );
+    let stored = grove_lib::chat::load_chat_history().expect("history readable");
+    assert!(
+        stored.is_empty(),
+        "a failed turn persists nothing: {stored:#?}"
+    );
+}
+
+#[test]
+fn a_non_stream_success_body_is_reported_not_rendered_as_empty() {
+    let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    isolate_store();
+
+    let body = "{\"error\":{\"message\":\"model overloaded\"}}";
+    let stub = serve_raw(format!("{}{body}", plain_json_head()));
+    settings_for(stub.base_url.clone());
+
+    let app = mock_app();
+    let receiver = collect(&app);
+    start_turn(&app, "turn-notsse", "say hello");
+    let payload = error_event(&receiver);
+    finish_stub(stub);
+
+    let message = payload["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("model overloaded") && message.contains("stream"),
+        "a 200 JSON error body is described readably: {message}"
+    );
+}
