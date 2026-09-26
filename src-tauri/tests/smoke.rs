@@ -276,31 +276,36 @@ fn registered_projects_report_sidebar_counts() {
 }
 
 #[test]
-fn scan_for_repos_lists_fixture_roots_only() {
+fn scan_for_repos_finds_repositories_nested_inside_repositories() {
     let fixture = Fixture::new("scan");
     let parent = fixture.canonical("");
 
+    // Independent repositories inside an umbrella repository are projects too; a
+    // vendored dependency with its own `.git` is not.
+    std::fs::create_dir_all(fixture.path("dirty/packages")).expect("packages dir");
+    fixture.init("dirty/packages/nested");
+    fixture.write("dirty/packages/nested/lib.txt", "nested\n");
+    fixture.commit_all("dirty/packages/nested", "initial");
+    std::fs::create_dir_all(fixture.path("dirty/node_modules")).expect("node_modules dir");
+    fixture.init("dirty/node_modules/vendored");
+
+    let mut expected = fixture.project_paths();
+    expected.push(fixture.canonical("dirty/packages/nested"));
+    expected.sort();
+
     let found = ready(scan_for_repos(parent.clone())).expect("scan");
-    assert_eq!(found, fixture.project_paths());
+    assert_eq!(found, expected);
     assert_eq!(
         find_repositories(Path::new(&parent), 6).expect("scan"),
         found
     );
 
-    // A repository is listed at whatever depth it sits at, including depth 0, and the
-    // walk never descends into one it already listed.
+    // Scanning a repository lists it and keeps looking inside it.
+    let dirty = fixture.canonical("dirty");
     assert_eq!(
-        find_repositories(Path::new(&found[0]), 6).expect("scan inside a repository"),
-        vec![found[0].clone()]
+        find_repositories(Path::new(&dirty), 6).expect("scan inside a repository"),
+        vec![dirty.clone(), fixture.canonical("dirty/packages/nested")]
     );
-    for path in &found {
-        for other in &found {
-            assert!(
-                path == other || !path.starts_with(&format!("{other}/")),
-                "{path} was listed inside {other}"
-            );
-        }
-    }
 }
 
 #[test]

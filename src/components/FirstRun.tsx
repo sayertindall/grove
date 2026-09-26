@@ -102,7 +102,7 @@ export function FirstRun({ onRegister }: FirstRunProps) {
               {directory === null ? "Scan" : `Scan ${folderName(directory)}`}
             </Button>
             <span className="text-xs text-muted-foreground">
-              Looks six levels deep and stops at each repository it finds.
+              Looks six levels deep, including repositories nested inside other repositories.
             </span>
           </div>
 

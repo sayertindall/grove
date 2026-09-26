@@ -7,10 +7,28 @@ use crate::error::GroveError;
 /// listed while its children are never entered.
 pub const REPOSITORY_SCAN_MAX_DEPTH: u32 = 6;
 
+/// Directories that hold dependencies or build output rather than the user's own
+/// repositories. They are never entered, so a vendored package with its own `.git`
+/// is not offered as a project.
+const SKIPPED_DIRECTORY_NAMES: [&str; 8] = [
+    ".git",
+    "node_modules",
+    "vendor",
+    "target",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+];
+
 /// A directory holds git metadata when it contains a `.git` directory (a normal
 /// repository) or a `.git` file (a linked worktree or submodule).
 pub fn directory_holds_git_metadata(directory: &Path) -> bool {
     directory.join(".git").exists()
+}
+
+fn is_skipped_directory_name(name: &std::ffi::OsStr) -> bool {
+    SKIPPED_DIRECTORY_NAMES.iter().any(|skipped| name == *skipped)
 }
 
 /// Returns the canonical absolute paths of every directory at or below `root`
@@ -28,7 +46,8 @@ pub fn find_repositories(root: &Path, max_depth: u32) -> Result<Vec<String>, Gro
     Ok(found)
 }
 
-/// Walks one directory: list it when it is a repository, otherwise descend.
+/// Walks one directory: list it when it is a repository, then descend either way, so
+/// independent repositories nested inside an umbrella repository are found too.
 pub fn visit_repository_candidate(
     directory: &Path,
     depth: u32,
@@ -37,7 +56,6 @@ pub fn visit_repository_candidate(
 ) {
     if directory_holds_git_metadata(directory) {
         found.push(canonical_string(directory));
-        return;
     }
 
     if depth >= max_depth {
@@ -51,7 +69,7 @@ pub fn visit_repository_candidate(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.file_name().is_some_and(|name| name == ".git") {
+        if path.file_name().is_some_and(is_skipped_directory_name) {
             continue;
         }
         // DirEntry::file_type does not follow symlinks, so a symlinked directory
