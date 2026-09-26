@@ -532,9 +532,24 @@ export default function App() {
       // The history panel lives in the single-file viewer. From the stream, open the
       // focused file there with history showing; elsewhere just toggle the panel.
       if (layoutMode === "stream") {
-        if (focus.projectPath === null || focus.file === null) return;
+        let fallback: { projectPath: string; filePath: string } | undefined;
+        for (const project of streamProjects) {
+          const file = allChanges.get(project.path)?.files[0];
+          if (file !== undefined) {
+            fallback = { projectPath: project.path, filePath: file.path };
+            break;
+          }
+        }
+        const focused =
+          focus.projectPath !== null && focus.file !== null
+            ? { projectPath: focus.projectPath, filePath: focus.file.path }
+            : fallback;
+        if (focused === undefined) {
+          toastManager.add({ title: "No changed file to show history for" });
+          return;
+        }
         dispatch({ type: "set-layout-mode", value: "file" });
-        openProjectFile(focus.projectPath, focus.file.path, "file");
+        openProjectFile(focused.projectPath, focused.filePath, "file");
         dispatch({ type: "set-history-open", open: true });
         return;
       }

@@ -11,6 +11,7 @@ import {
   openFile,
   readJson,
   timedExternalEdit,
+  triageOrder,
   waitForStore,
 } from "./lib/kit.mjs";
 import { page } from "./lib/page.mjs";
@@ -500,8 +501,36 @@ return {
     {
       name: "history-panel",
       expected:
-        "⌘Y opens the history panel for unstaged.txt; Blame lists one line per line of the working copy, the committed lines with a commit and the uncommitted ones as “not committed”; ⌘Y closes it.",
+        "⌘Y opens the history panel for unstaged.txt; Blame lists one line per line of the working copy, the committed lines with a commit and the uncommitted ones as “not committed”; ⌘Y closes it. In a fresh Stream with no click or scroll, ⌘Y still opens the first file of the first dirty project.",
       async run(checks) {
+        // Cold stream: ⌘Y with no click and no scroll must not be a silent no-op.
+        // The stream's first row belongs to the first dirty project in sidebar
+        // (triage) order, not raw CLI status order.
+        const firstProject = triageOrder(ctx.oracle.status, ctx.oracle.changes).find(
+          (projectPath) => (ctx.oracle.changes[projectPath]?.length ?? 0) > 0,
+        );
+        const firstFile = ctx.oracle.changes[firstProject][0].path;
+        const cold = await ctx.bridge.eval(
+          page(`
+await setLayout("Stream");
+await sleep(300);
+press("y", { metaKey: true, code: "KeyY" });
+const panel = await waitFor(() => document.querySelector('[data-testid="history-panel"]'), "history panel without any click or scroll");
+const fileLayout = buttonNamed("File", group("Layout"))?.getAttribute("aria-pressed") === "true";
+const label = panel.getAttribute("aria-label");
+await sleep(300);
+press("y", { metaKey: true, code: "KeyY" });
+await waitFor(() => !document.querySelector('[data-testid="history-panel"]'), "cold history closed");
+return { fileLayout, label };`),
+        );
+        await ctx.shot("history-panel-cold-stream");
+        check(checks, "cold stream ⌘Y switches to the File layout", true, cold.fileLayout);
+        check(
+          checks,
+          `cold stream ⌘Y opens the first file (${firstFile})`,
+          `History of ${firstFile}`,
+          cold.label,
+        );
         await openFile(ctx, projects.dirty, "unstaged.txt");
         const lines = fs
           .readFileSync(path.join(projects.dirty, "unstaged.txt"), "utf8")

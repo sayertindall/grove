@@ -5,6 +5,7 @@ import { ArrowUpIcon, ChevronDownIcon, ChevronRightIcon, GitBranchIcon } from "l
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -175,6 +176,20 @@ export function ChangeStream({
     const row = activeFileId === null ? undefined : rowsById.get(activeFileId);
     onActiveFileChange(row?.project.path ?? null, row?.kind === "file" ? row.file.path : null);
   }, [activeFileId, rowsById, onActiveFileChange]);
+
+  // Establish the active file as soon as rows exist, not only on scroll or click:
+  // without this, focus.file stays null on a fresh launch and ⌘Y silently no-ops.
+  // Only step in when nothing is active or the tracked row went clean, so a click
+  // on an off-screen file survives later diff loads. If CodeView has not laid
+  // headers out yet, fall back to the first file row.
+  useLayoutEffect(() => {
+    if (fileRows.length === 0) return;
+    if (activeFileId !== null && rowsById.has(activeFileId)) return;
+    syncTop();
+    setActiveFileId((current) =>
+      current !== null && rowsById.has(current) ? current : (fileRows[0]?.id ?? null),
+    );
+  }, [items, activeFileId, fileRows, rowsById, syncTop]);
 
   useUnseenChanges(fileRows, scrollTopRef, setUnseenIds);
 
