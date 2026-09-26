@@ -2,7 +2,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { FolderIcon } from "lucide-react";
 import { useState } from "react";
 
-import { toError } from "@/api/grove";
+import { toError } from "@/api/invoke";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {

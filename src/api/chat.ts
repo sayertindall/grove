@@ -1,31 +1,28 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invokeCommand, toError } from "@/api/invoke";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-
-import { toError } from "@/api/grove";
 import type {
+  ChatCliCommand,
+  ChatCliStatus,
   ChatDeltaEvent,
   ChatDoneEvent,
+  ChatEgressEvent,
   ChatErrorEvent,
   ChatMessage,
+  ChatPreview,
   ChatReasoningEvent,
   ChatSendRequest,
   ChatSettings,
   ChatToolEvent,
+  ChatUsage,
 } from "@/types/grove";
+
+export const CHAT_EGRESS_EVENT = "grove://chat-egress";
 
 export const CHAT_DELTA_EVENT = "grove://chat-delta";
 export const CHAT_REASONING_EVENT = "grove://chat-reasoning";
 export const CHAT_TOOL_EVENT = "grove://chat-tool";
 export const CHAT_DONE_EVENT = "grove://chat-done";
 export const CHAT_ERROR_EVENT = "grove://chat-error";
-
-async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  try {
-    return await invoke<T>(command, args);
-  } catch (error) {
-    throw toError(error);
-  }
-}
 
 /** The stored chat settings (provider, endpoint, model, limits, egress consent). */
 export function chatSettings(): Promise<ChatSettings> {
@@ -70,6 +67,31 @@ export function chatCancel(turnId: string): Promise<void> {
 /** Deletes the persisted transcript. */
 export function chatClear(): Promise<void> {
   return invokeCommand<void>("chat_clear");
+}
+
+/** Exactly what the turn would send, measured without sending it. */
+export function chatPreview(request: ChatSendRequest): Promise<ChatPreview> {
+  return invokeCommand<ChatPreview>("chat_preview", { request });
+}
+
+/** Tokens spent this session and this month. */
+export function chatUsage(): Promise<ChatUsage> {
+  return invokeCommand<ChatUsage>("chat_usage");
+}
+
+/** Whether the `claude` / `codex` CLI is installed, and its version. */
+export function chatCliStatus(command: ChatCliCommand): Promise<ChatCliStatus> {
+  return invokeCommand<ChatCliStatus>("chat_cli_status", { command });
+}
+
+export async function listenForChatEgress(
+  onEvent: (event: ChatEgressEvent) => void,
+): Promise<UnlistenFn> {
+  try {
+    return await listen<ChatEgressEvent>(CHAT_EGRESS_EVENT, (event) => onEvent(event.payload));
+  } catch (error) {
+    throw toError(error);
+  }
 }
 
 export async function listenForChatDelta(

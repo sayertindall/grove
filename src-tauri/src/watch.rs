@@ -13,7 +13,10 @@ use notify_debouncer_full::{
     new_debouncer_opt, DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
 };
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+
+use crate::error::GroveError;
+use crate::repo_cache::RepoCache;
 
 /// Quiet period after the last filesystem event before one event is emitted.
 pub const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -36,11 +39,21 @@ pub struct ProjectsChanged {
     pub paths: Vec<String>,
 }
 
+/// A git directory outside a project's tree that still decides what the project
+/// shows: a linked worktree's own gitdir (its `index` and `HEAD`) and the shared
+/// common dir (branch refs, `packed-refs`, `FETCH_HEAD`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDirWatch {
+    pub dir: String,
+    pub project: String,
+}
+
 #[derive(Default)]
 struct WatchLists {
     watching: HashSet<String>,
     pending: Vec<String>,
     repos: HashMap<String, Repository>,
+    git_dirs: Vec<GitDirWatch>,
 }
 
 /// The one long-lived piece of runtime state: the debouncer watching every registered
@@ -89,90 +102,37 @@ pub fn watching_paths(watcher: &Mutex<ProjectWatcher>) -> HashSet<String> {
 /// Drops the previous watcher and builds one for the given roots. An empty list
 /// leaves no watcher at all. A root that cannot be armed stays pending and is
 /// retried every five seconds; when it reappears, a change is emitted for it.
+/// Cached reads are dropped: nothing watched the projects in between.
 pub fn rebuild_project_watchers<R: Runtime>(
     app: &AppHandle<R>,
     watcher: &Mutex<ProjectWatcher>,
     paths: &[String],
-) -> Result<(), String> {
+) -> Result<(), GroveError> {
     shutdown_rearm(watcher);
-
     let (debouncer_slot, lists) = {
         let guard = lock_watcher(watcher);
         (Arc::clone(&guard.debouncer), Arc::clone(&guard.lists))
     };
-
-    {
-        let mut slot = lock_slot(&debouncer_slot);
-        *slot = None;
+    *lock_slot(&debouncer_slot) = None;
+    *lock_lists(&lists) = WatchLists::default();
+    if let Some(cache) = app.try_state::<RepoCache>() {
+        cache.invalidate_all();
     }
-    {
-        let mut lists = lock_lists(&lists);
-        lists.watching.clear();
-        lists.pending.clear();
-        lists.repos.clear();
-    }
-
     if paths.is_empty() {
         return Ok(());
     }
 
-    let app_for_events = app.clone();
-    let projects = Arc::new(paths.to_vec());
-    let callback_projects = Arc::clone(&projects);
-    let callback_lists = Arc::clone(&lists);
-    let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
-        WATCH_DEBOUNCE,
-        None,
-        move |result: DebounceEventResult| match result {
-            Ok(events) => {
-                emit_for_events(
-                    &app_for_events,
-                    &events,
-                    &callback_projects,
-                    &callback_lists,
-                );
-            }
-            Err(errors) => note_watch_errors(&errors, &callback_projects, &callback_lists),
-        },
-        NoCache,
-        Config::default(),
-    )
-    .map_err(|error| error.to_string())?;
-
-    let mut watching = HashSet::new();
-    let mut pending = Vec::new();
-    let mut repos = HashMap::new();
-    for path in projects.iter() {
-        match debouncer.watch(PathBuf::from(path), RecursiveMode::Recursive) {
-            Ok(()) => {
-                watching.insert(path.clone());
-                cache_repository(&mut repos, path);
-            }
-            Err(error) => {
-                eprintln!("{path}: {error}");
-                pending.push(path.clone());
-            }
-        }
-    }
-
-    {
-        let mut lists = lock_lists(&lists);
-        lists.watching = watching;
-        lists.pending = pending;
-        lists.repos = repos;
-    }
-    {
-        let mut slot = lock_slot(&debouncer_slot);
-        *slot = Some(debouncer);
-    }
+    let mut debouncer = project_debouncer(app, paths, &lists)?;
+    let armed = arm_roots(&mut debouncer, paths);
+    *lock_lists(&lists) = armed;
+    *lock_slot(&debouncer_slot) = Some(debouncer);
 
     let (stop, receiver) = mpsc::channel();
     let app_for_rearm = app.clone();
     let thread = std::thread::Builder::new()
         .name("grove-watch-rearm".to_string())
         .spawn(move || rearm_loop(app_for_rearm, lists, debouncer_slot, receiver))
-        .map_err(|error| format!("watch rearm: {error}"))?;
-
+        .map_err(|error| GroveError::io("watch rearm", error))?;
     let mut guard = lock_watcher(watcher);
     guard.rearm_stop = Some(stop);
     guard.rearm_thread = Some(thread);
@@ -183,7 +143,7 @@ pub fn rebuild_project_watchers<R: Runtime>(
 ///
 /// Events under `.git/` are dropped except the refs and files that change what
 /// the sidebar shows. Gitignored paths are dropped. A linked worktree's `.git`
-/// file is not a directory, and its gitdir lives elsewhere, so it is not watched.
+/// file is not a directory; its gitdir is watched separately (`GitDirWatch`).
 pub fn watcher_keeps_path(project: &str, changed: &str, ignored: bool) -> bool {
     let Some(relative) = relative_to_project(project, changed) else {
         return false;
@@ -196,22 +156,23 @@ pub fn watcher_keeps_path(project: &str, changed: &str, ignored: bool) -> bool {
 
 /// The registered projects whose trees received events worth refreshing, in stored
 /// order. Ignored paths and git internals are dropped before a project is selected.
+/// An event inside a watched git directory refreshes the project that owns it.
 pub fn project_paths_for_events(
     events: &[DebouncedEvent],
     projects: &[String],
     repos: &HashMap<String, Repository>,
+    git_dirs: &[GitDirWatch],
 ) -> Vec<String> {
     let mut matched: HashSet<&str> = HashSet::new();
-    for event in events {
-        for path in &event.event.paths {
-            let changed = path.to_string_lossy();
-            let Some(project) = longest_project_prefix(&changed, projects) else {
-                continue;
-            };
-            let ignored = repo_ignores_path(repos.get(project), project, &changed);
-            if watcher_keeps_path(project, &changed, ignored) {
-                matched.insert(project);
-            }
+    for path in events.iter().flat_map(|event| &event.event.paths) {
+        let changed = path.to_string_lossy();
+        matched.extend(git_dir_projects(&changed, git_dirs));
+        let Some(project) = longest_project_prefix(&changed, projects) else {
+            continue;
+        };
+        let ignored = repo_ignores_path(repos.get(project), project, &changed);
+        if watcher_keeps_path(project, &changed, ignored) {
+            matched.insert(project);
         }
     }
 
@@ -222,11 +183,101 @@ pub fn project_paths_for_events(
         .collect()
 }
 
-/// Emits the one event the webview listens for. A failure is logged, never fatal:
-/// the app keeps watching.
+/// Emits the one event the webview listens for. The named projects' cached reads
+/// are invalidated first, so the refetch the event triggers reads fresh. A failure
+/// is logged, never fatal: the app keeps watching.
 pub fn emit_projects_changed<R: Runtime>(app: &AppHandle<R>, paths: Vec<String>) {
+    if let Some(cache) = app.try_state::<RepoCache>() {
+        cache.invalidate(&paths);
+    }
     if let Err(error) = app.emit(PROJECTS_CHANGED_EVENT, ProjectsChanged { paths }) {
         eprintln!("{PROJECTS_CHANGED_EVENT}: {error}");
+    }
+}
+
+fn project_debouncer<R: Runtime>(
+    app: &AppHandle<R>,
+    paths: &[String],
+    lists: &Arc<Mutex<WatchLists>>,
+) -> Result<RecommendedDebouncer, GroveError> {
+    let app = app.clone();
+    let projects = paths.to_vec();
+    let lists = Arc::clone(lists);
+    new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+        WATCH_DEBOUNCE,
+        None,
+        move |result: DebounceEventResult| match result {
+            Ok(events) => emit_for_events(&app, &events, &projects, &lists),
+            Err(errors) => note_watch_errors(&errors, &projects, &lists),
+        },
+        NoCache,
+        Config::default(),
+    )
+    .map_err(|error| GroveError::Io {
+        context: "watcher".to_string(),
+        source: std::io::Error::other(error.to_string()),
+    })
+}
+
+/// Arms every root it can; the rest stay pending for the rearm thread.
+fn arm_roots(debouncer: &mut RecommendedDebouncer, paths: &[String]) -> WatchLists {
+    let mut lists = WatchLists::default();
+    for path in paths {
+        match debouncer.watch(PathBuf::from(path), RecursiveMode::Recursive) {
+            Ok(()) => arm_project(debouncer, &mut lists, path),
+            Err(error) => {
+                eprintln!("{path}: {error}");
+                lists.pending.push(path.clone());
+            }
+        }
+    }
+    lists
+}
+
+/// Records an armed root and watches the git directories it keeps elsewhere.
+fn arm_project(debouncer: &mut RecommendedDebouncer, lists: &mut WatchLists, path: &str) {
+    lists.watching.insert(path.to_string());
+    lists.pending.retain(|pending| pending != path);
+    cache_repository(&mut lists.repos, path);
+    let Some(repository) = lists.repos.get(path) else {
+        return;
+    };
+    for watch in external_git_dirs(repository, path) {
+        arm_git_dir(debouncer, &watch);
+        lists.git_dirs.push(watch);
+    }
+}
+
+/// A linked worktree's gitdir and the common dir both live outside its tree. A
+/// normal repository's `.git` is inside the tree and already watched.
+fn external_git_dirs(repository: &Repository, project: &str) -> Vec<GitDirWatch> {
+    if !repository.is_worktree() {
+        return Vec::new();
+    }
+    [repository.path(), repository.commondir()]
+        .into_iter()
+        .map(|dir| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+        .map(|dir| dir.to_string_lossy().trim_end_matches('/').to_string())
+        .filter(|dir| relative_to_project(project, dir).is_none())
+        .map(|dir| GitDirWatch {
+            dir,
+            project: project.to_string(),
+        })
+        .collect()
+}
+
+/// The directory itself for `HEAD`/`index`/`FETCH_HEAD`, and `refs/` in depth.
+/// Objects and logs are never watched.
+fn arm_git_dir(debouncer: &mut RecommendedDebouncer, watch: &GitDirWatch) {
+    let dir = PathBuf::from(&watch.dir);
+    if let Err(error) = debouncer.watch(dir.clone(), RecursiveMode::NonRecursive) {
+        eprintln!("{}: {error}", watch.dir);
+    }
+    let refs = dir.join("refs");
+    if refs.is_dir() {
+        if let Err(error) = debouncer.watch(refs, RecursiveMode::Recursive) {
+            eprintln!("{}/refs: {error}", watch.dir);
+        }
     }
 }
 
@@ -261,34 +312,20 @@ fn rearm_missing<R: Runtime>(
     debouncer: &Mutex<Option<RecommendedDebouncer>>,
 ) {
     let pending = lock_lists(lists).pending.clone();
-    if pending.is_empty() {
-        return;
-    }
-
     let mut appeared = Vec::new();
-    for path in pending {
-        if !Path::new(&path).exists() {
-            continue;
-        }
-        let watched = {
-            let mut slot = lock_slot(debouncer);
-            let Some(debouncer) = slot.as_mut() else {
-                return;
-            };
-            debouncer.watch(PathBuf::from(&path), RecursiveMode::Recursive)
+    for path in pending.iter().filter(|path| Path::new(path).exists()) {
+        let mut slot = lock_slot(debouncer);
+        let Some(debouncer) = slot.as_mut() else {
+            return;
         };
-        match watched {
+        match debouncer.watch(PathBuf::from(path), RecursiveMode::Recursive) {
             Ok(()) => {
-                let mut lists = lock_lists(lists);
-                lists.watching.insert(path.clone());
-                lists.pending.retain(|pending| pending != &path);
-                cache_repository(&mut lists.repos, &path);
-                appeared.push(path);
+                arm_project(debouncer, &mut lock_lists(lists), path);
+                appeared.push(path.clone());
             }
             Err(error) => eprintln!("{path}: {error}"),
         }
     }
-
     if !appeared.is_empty() {
         emit_projects_changed(app, appeared);
     }
@@ -302,7 +339,7 @@ fn emit_for_events<R: Runtime>(
 ) {
     let changed = {
         let lists = lock_lists(lists);
-        project_paths_for_events(events, projects, &lists.repos)
+        project_paths_for_events(events, projects, &lists.repos, &lists.git_dirs)
     };
     if changed.is_empty() {
         return;
@@ -364,10 +401,33 @@ fn relative_to_project(project: &str, changed: &str) -> Option<String> {
 }
 
 fn drops_git_metadata(relative: &str) -> bool {
-    let Some(rest) = relative.strip_prefix(".git/") else {
-        return false;
-    };
-    !matches!(rest, "index" | "HEAD" | "packed-refs" | "refs") && !rest.starts_with("refs/")
+    relative
+        .strip_prefix(".git/")
+        .is_some_and(|rest| !git_dir_entry_matters(rest))
+}
+
+/// The entries of a git directory whose change can alter status, branch, or
+/// ahead/behind: the index, HEAD and the refs that move it, and fetch results.
+fn git_dir_entry_matters(relative: &str) -> bool {
+    matches!(
+        relative,
+        "index" | "HEAD" | "ORIG_HEAD" | "FETCH_HEAD" | "packed-refs" | "refs"
+    ) || relative.starts_with("refs/")
+}
+
+/// Projects whose external git directories hold `changed` at an entry that matters.
+fn git_dir_projects<'dirs>(
+    changed: &str,
+    git_dirs: &'dirs [GitDirWatch],
+) -> impl Iterator<Item = &'dirs str> {
+    let changed = changed.to_string();
+    git_dirs
+        .iter()
+        .filter(move |watch| {
+            relative_to_project(&watch.dir, &changed)
+                .is_some_and(|relative| git_dir_entry_matters(&relative))
+        })
+        .map(|watch| watch.project.as_str())
 }
 
 fn longest_project_prefix<'projects>(
@@ -501,6 +561,7 @@ mod tests {
             ],
             &projects,
             &repos,
+            &[],
         );
         assert!(dropped.is_empty());
 
@@ -508,6 +569,7 @@ mod tests {
             &[event_for(&format!("{project}/.git/index"))],
             &projects,
             &repos,
+            &[],
         );
         assert_eq!(kept, vec![project]);
         let _ = std::fs::remove_dir_all(&root);

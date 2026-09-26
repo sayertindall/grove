@@ -1,23 +1,53 @@
-import { useRef } from "react";
+import { useRef, type KeyboardEvent } from "react";
 
 interface SplitterProps {
   label: string;
+  /** Current pane width, for the separator's aria value. */
+  ariaValueNow: number;
+  ariaValueMin: number;
+  ariaValueMax: number;
   onResize: (delta: number) => void;
   onResizeEnd?: () => void;
 }
 
-export function Splitter({ label, onResize, onResizeEnd }: SplitterProps) {
+const KEY_STEP = 16;
+const KEY_STEP_LARGE = 64;
+
+export function Splitter({
+  label,
+  ariaValueNow,
+  ariaValueMin,
+  ariaValueMax,
+  onResize,
+  onResizeEnd,
+}: SplitterProps) {
   const onResizeRef = useRef(onResize);
   const onResizeEndRef = useRef(onResizeEnd);
   onResizeRef.current = onResize;
   onResizeEndRef.current = onResizeEnd;
+
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? KEY_STEP_LARGE : KEY_STEP;
+    let delta = 0;
+    if (event.key === "ArrowLeft" || event.key === "ArrowUp") delta = -step;
+    else if (event.key === "ArrowRight" || event.key === "ArrowDown") delta = step;
+    else return;
+    event.preventDefault();
+    onResizeRef.current(delta);
+    onResizeEndRef.current?.();
+  };
 
   return (
     <div
       role="separator"
       aria-orientation="vertical"
       aria-label={label}
-      className="relative w-px shrink-0 cursor-col-resize bg-border before:absolute before:inset-y-0 before:-left-1 before:w-2"
+      aria-valuenow={ariaValueNow}
+      aria-valuemin={ariaValueMin}
+      aria-valuemax={ariaValueMax}
+      tabIndex={0}
+      onKeyDown={onKeyDown}
+      className="relative w-px shrink-0 cursor-col-resize bg-border outline-none focus-visible:bg-ring before:absolute before:inset-y-0 before:-left-1 before:w-2"
       onPointerDown={(event) => {
         if (event.button !== 0) return;
         event.preventDefault();

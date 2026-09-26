@@ -14,6 +14,9 @@ const GIT_STATUS: Record<FileChangeStatus, GitStatus> = {
   deleted: "deleted",
   renamed: "renamed",
   untracked: "untracked",
+  // The tree has no conflict or submodule status; both are content changes to it.
+  conflicted: "modified",
+  submodule: "modified",
 };
 
 const menuItemClass =
@@ -51,13 +54,19 @@ export function ChangesTree({
     () => changes.map((change) => ({ path: change.path, status: GIT_STATUS[change.status] })),
     [changes],
   );
+  const changesByPath = useMemo<Record<string, ChangeSummary>>(
+    () => Object.fromEntries(changes.map((change) => [change.path, change])),
+    [changes],
+  );
 
   const changesRef = useRef(changes);
+  const changesByPathRef = useRef(changesByPath);
   const selectionRef = useRef(onSelectChange);
   const ignoreFocusRef = useRef(false);
   useEffect(() => {
     changesRef.current = changes;
-  }, [changes]);
+    changesByPathRef.current = changesByPath;
+  }, [changes, changesByPath]);
   useEffect(() => {
     selectionRef.current = onSelectChange;
   }, [onSelectChange]);
@@ -69,13 +78,11 @@ export function ChangesTree({
     initialExpansion: "open",
     gitStatus,
     renderRowDecoration: ({ item }) => {
-      const change = changesRef.current.find((entry) => entry.path === item.path);
+      const change = changesByPathRef.current[item.path];
       return change === undefined ? null : rowDecorationForChange(change);
     },
     onSelectionChange: (selected) => {
-      const next = selected.find((path) =>
-        changesRef.current.some((entry) => entry.path === path),
-      );
+      const next = selected.find((path) => changesRef.current.some((entry) => entry.path === path));
       if (next !== undefined) selectionRef.current(next);
     },
   });
@@ -118,27 +125,30 @@ export function ChangesTree({
     });
   }, [model]);
 
+  // Applying the app's selection moves the tree's selection and focus itself; the
+  // focus-follows-selection sync above must not read those intermediate states
+  // (focus still on a row being deselected) as a user move and re-select it.
   useEffect(() => {
-    if (selectedPath === null) {
-      ignoreFocusRef.current = true;
-      try {
+    ignoreFocusRef.current = true;
+    try {
+      if (selectedPath === null) {
         for (const path of model.getSelectedPaths()) model.getItem(path)?.deselect();
-      } finally {
-        ignoreFocusRef.current = false;
+        return;
       }
-      return;
-    }
-    const item = model.getItem(selectedPath);
-    if (item === null || item.isDirectory()) return;
-    const selected = model.getSelectedPaths();
-    if (!(selected.length === 1 && selected[0] === selectedPath)) {
-      for (const path of selected) {
-        if (path !== selectedPath) model.getItem(path)?.deselect();
+      const item = model.getItem(selectedPath);
+      if (item === null || item.isDirectory()) return;
+      const selected = model.getSelectedPaths();
+      if (!(selected.length === 1 && selected[0] === selectedPath)) {
+        for (const path of selected) {
+          if (path !== selectedPath) model.getItem(path)?.deselect();
+        }
+        if (!item.isSelected()) item.select();
       }
-      if (!item.isSelected()) item.select();
+      if (model.getFocusedPath() !== selectedPath) model.focusPath(selectedPath);
+      model.scrollToPath(selectedPath, { offset: "nearest", focus: false });
+    } finally {
+      ignoreFocusRef.current = false;
     }
-    if (model.getFocusedPath() !== selectedPath) model.focusPath(selectedPath);
-    model.scrollToPath(selectedPath, { offset: "nearest", focus: false });
   }, [model, selectedPath, paths]);
 
   useEffect(() => {
@@ -160,6 +170,7 @@ export function ChangesTree({
 
   return (
     <section
+      aria-label="Changed files"
       style={{ width }}
       className="flex h-full shrink-0 flex-col bg-background"
     >

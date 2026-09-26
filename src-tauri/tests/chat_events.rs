@@ -14,7 +14,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use grove_lib::chat::{
-    save_chat_settings, ChatContext, ChatSendRequest, ChatSettings, ProviderKindWire,
+    save_chat_settings, ChatContext, ChatSendRequest, ChatSettings, CostCaps, ProviderKindWire,
+    QuickAction,
 };
 use serde_json::Value;
 use tauri::test::{mock_builder, mock_context, noop_assets, MockRuntime};
@@ -25,7 +26,8 @@ static ENV: Mutex<()> = Mutex::new(());
 static FIXTURES: AtomicU32 = AtomicU32::new(0);
 
 /// The channels the panel listens on, in the order a healthy turn uses them.
-const CHANNELS: [&str; 5] = [
+const CHANNELS: [&str; 6] = [
+    "grove://chat-egress",
     "grove://chat-delta",
     "grove://chat-reasoning",
     "grove://chat-tool",
@@ -217,17 +219,25 @@ fn settings_for(base_url: String) -> ChatSettings {
         max_tokens: 256,
         temperature: None,
         allow_cloud_egress: false,
+        ..ChatSettings::default()
     };
     save_chat_settings(&settings).expect("settings persist");
     settings
 }
 
 fn start_turn(app: &App<MockRuntime>, turn_id: &str, text: &str) {
-    let request = ChatSendRequest {
-        turn_id: turn_id.to_string(),
-        text: text.to_string(),
-        context: ChatContext::default(),
-    };
+    start_request(
+        app,
+        ChatSendRequest {
+            turn_id: turn_id.to_string(),
+            text: text.to_string(),
+            context: ChatContext::default(),
+            action: None,
+        },
+    );
+}
+
+fn start_request(app: &App<MockRuntime>, request: ChatSendRequest) {
     let handle = app.handle().clone();
     tauri::async_runtime::block_on(async move {
         grove_lib::commands::chat_send(handle, request)
@@ -273,8 +283,8 @@ fn one_turn_reaches_the_webview_with_addressable_payloads() {
         .collect();
     assert_eq!(
         kinds,
-        vec!["delta", "delta", "done"],
-        "one turn emits its deltas then a done: {events:#?}"
+        vec!["egress", "delta", "delta", "done"],
+        "one turn reports what it sends, then its deltas, then a done: {events:#?}"
     );
 
     for (channel, payload) in &events {
@@ -285,12 +295,21 @@ fn one_turn_reaches_the_webview_with_addressable_payloads() {
         );
     }
 
-    assert_eq!(events[0].0, "grove://chat-delta");
-    assert_eq!(events[0].1["text"].as_str(), Some("Hello"));
-    assert_eq!(events[1].1["text"].as_str(), Some(" world"));
+    assert_eq!(events[0].0, "grove://chat-egress");
+    assert_eq!(events[0].1["loopback"].as_bool(), Some(true));
+    assert!(
+        events[0].1["sentBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "the counter names the bytes that left: {}",
+        events[0].1
+    );
+    assert_eq!(events[1].0, "grove://chat-delta");
+    assert_eq!(events[1].1["text"].as_str(), Some("Hello"));
+    assert_eq!(events[2].1["text"].as_str(), Some(" world"));
 
-    let done = &events[2].1;
-    assert_eq!(events[2].0, "grove://chat-done");
+    let done = &events[3].1;
+    assert_eq!(events[3].0, "grove://chat-done");
     assert_eq!(
         done["message"]["text"].as_str(),
         Some("Hello world"),
@@ -312,6 +331,11 @@ fn one_turn_reaches_the_webview_with_addressable_payloads() {
         done.get("totalTokens").is_some(),
         "token usage travels as camelCase: {done}"
     );
+    assert!(
+        done["message"].get("replay").is_none(),
+        "replayed tool payloads stay on disk, never on the webview channel: {done}"
+    );
+    assert_eq!(done["message"]["cached"].as_bool(), Some(false));
 
     let stored = grove_lib::chat::load_chat_history().expect("history readable");
     assert_eq!(stored.len(), 2, "the turn persists its question and answer");
@@ -331,7 +355,10 @@ fn a_provider_failure_settles_the_turn_instead_of_hanging() {
     let receiver = collect(&app);
     start_turn(&app, "turn-refused", "say hello");
 
-    let events = drain_until_settled(&receiver);
+    let events: Vec<(String, Value)> = drain_until_settled(&receiver)
+        .into_iter()
+        .filter(|(channel, _)| channel != "grove://chat-egress")
+        .collect();
     finish_stub(stub);
 
     assert_eq!(
@@ -501,4 +528,379 @@ fn a_non_stream_success_body_is_reported_not_rendered_as_empty() {
         message.contains("model overloaded") && message.contains("stream"),
         "a 200 JSON error body is described readably: {message}"
     );
+}
+
+// --- Assistant: replay, findings, cost caps, summary cache -----------------------
+//
+// Ways these fail, written before the code they check:
+// - A replayed assistant turn drops its tool calls, or keeps the calls but loses
+//   their results, or pairs a result with the wrong call id: every provider
+//   rejects the conversation, or the model re-reads what it already read.
+// - The Anthropic replay puts a tool_result anywhere but in the user message
+//   directly after its tool_use.
+// - A finding outside every hunk (or in a file that did not change) reaches the
+//   gutter as if it were anchored, or is dropped silently with no count.
+// - A turn over its cost cap still reaches the provider, or fails with a vague
+//   message, or fails without settling the panel.
+// - A repeated identical request contacts the provider again, or the cached
+//   answer arrives without the `cached` mark.
+
+/// A provider that answers each request in turn with the next canned response and
+/// records every request body, so a test can count and inspect what was sent.
+struct Recorder {
+    base_url: String,
+    bodies: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+fn serve_sequence(responses: Vec<String>) -> Recorder {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    listener
+        .set_nonblocking(true)
+        .expect("non-blocking listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (recorded, stopping) = (Arc::clone(&bodies), Arc::clone(&stop));
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut served = 0usize;
+        while !stopping.load(Ordering::Relaxed) && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).expect("blocking stream");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let request = read_request(&stream);
+            let body = request
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body.to_string())
+                .unwrap_or_default();
+            recorded.lock().expect("recorder lock").push(body);
+            let response = responses.get(served).cloned().unwrap_or_else(|| {
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            });
+            served += 1;
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    Recorder {
+        base_url: format!("http://127.0.0.1:{port}"),
+        bodies,
+        stop,
+        thread,
+    }
+}
+
+/// Stops the recorder and returns every request body it saw, parsed.
+fn stop_recorder(recorder: Recorder) -> Vec<Value> {
+    recorder.stop.store(true, Ordering::Relaxed);
+    assert!(recorder.thread.join().is_ok(), "the recorder panicked");
+    let bodies = recorder.bodies.lock().expect("recorder lock").clone();
+    bodies
+        .iter()
+        .map(|body| serde_json::from_str(body).expect("request body is JSON"))
+        .collect()
+}
+
+fn openai_answer(text: &str) -> String {
+    format!("{}{}data: [DONE]\n\n", sse_head(), openai_delta(text))
+}
+
+fn openai_tool_call(id: &str, name: &str) -> String {
+    let frame = serde_json::json!({
+        "choices": [{ "index": 0, "delta": { "tool_calls": [{
+            "index": 0, "id": id, "type": "function",
+            "function": { "name": name, "arguments": "{}" },
+        }]}}],
+    });
+    format!("{}data: {frame}\n\ndata: [DONE]\n\n", sse_head())
+}
+
+fn anthropic_answer(text: &str) -> String {
+    let frames = [
+        serde_json::json!({"type": "message_start", "message": {"usage": {"input_tokens": 3}}}),
+        serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+        serde_json::json!({"type": "message_stop"}),
+    ];
+    let body: String = frames
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+    format!("{}{body}", sse_head())
+}
+
+/// Runs one turn to completion and returns its settling payload.
+fn run_request(app: &App<MockRuntime>, request: ChatSendRequest) -> (String, Value) {
+    let receiver = collect(app);
+    start_request(app, request);
+    drain_until_settled(&receiver)
+        .pop()
+        .expect("the turn settles")
+}
+
+fn plain_request(turn_id: &str, text: &str) -> ChatSendRequest {
+    ChatSendRequest {
+        turn_id: turn_id.to_string(),
+        text: text.to_string(),
+        context: ChatContext::default(),
+        action: None,
+    }
+}
+
+#[test]
+fn replayed_history_carries_tool_calls_and_their_results_in_provider_format() {
+    let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    isolate_store();
+
+    let recorder = serve_sequence(vec![
+        openai_tool_call("call-1", "list_projects"),
+        openai_answer("No projects are registered."),
+        openai_answer("Still none."),
+        anthropic_answer("None, again."),
+    ]);
+    let mut settings = settings_for(recorder.base_url.clone());
+    let app = mock_app();
+
+    let (channel, done) = run_request(&app, plain_request("turn-tools", "what is registered?"));
+    assert_eq!(channel, "grove://chat-done", "{done}");
+    let (channel, done) = run_request(&app, plain_request("turn-openai", "and now?"));
+    assert_eq!(channel, "grove://chat-done", "{done}");
+
+    settings.provider = ProviderKindWire::Anthropic;
+    save_chat_settings(&settings).expect("settings persist");
+    let (channel, done) = run_request(&app, plain_request("turn-anthropic", "last time?"));
+    assert_eq!(channel, "grove://chat-done", "{done}");
+
+    let bodies = stop_recorder(recorder);
+    assert_eq!(
+        bodies.len(),
+        4,
+        "tool round, answer, two replays: {bodies:#?}"
+    );
+
+    // OpenAI: the assistant's tool_calls, then a tool message answering that id,
+    // then the assistant's final text, then the new question.
+    let messages = bodies[2]["messages"].as_array().expect("messages");
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| message["role"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["system", "user", "assistant", "tool", "assistant", "user"],
+        "the earlier turn replays its tool round: {messages:#?}"
+    );
+    assert_eq!(messages[2]["tool_calls"][0]["id"].as_str(), Some("call-1"));
+    assert_eq!(
+        messages[2]["tool_calls"][0]["function"]["name"].as_str(),
+        Some("list_projects")
+    );
+    assert_eq!(messages[3]["tool_call_id"].as_str(), Some("call-1"));
+    assert!(
+        messages[3]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("projects")),
+        "the tool's own result is replayed, not a placeholder: {}",
+        messages[3]
+    );
+    assert_eq!(
+        messages[4]["content"].as_str(),
+        Some("No projects are registered.")
+    );
+
+    // Anthropic: tool_use in the assistant turn, its tool_result in the very
+    // next user message, same id.
+    let messages = bodies[3]["messages"].as_array().expect("messages");
+    let has_tool_use = |message: &Value| {
+        message["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_use"))
+    };
+    let use_at = messages
+        .iter()
+        .position(has_tool_use)
+        .expect("a replayed tool_use block");
+    let tool_use = messages[use_at]["content"]
+        .as_array()
+        .and_then(|blocks| blocks.iter().find(|block| block["type"] == "tool_use"))
+        .expect("tool_use block");
+    assert_eq!(tool_use["id"].as_str(), Some("call-1"));
+    let answer = &messages[use_at + 1];
+    assert_eq!(answer["role"].as_str(), Some("user"));
+    assert_eq!(answer["content"][0]["type"].as_str(), Some("tool_result"));
+    assert_eq!(answer["content"][0]["tool_use_id"].as_str(), Some("call-1"));
+    assert!(
+        bodies[3].get("system").is_some(),
+        "the system prompt travels in Anthropic's own field: {}",
+        bodies[3]
+    );
+}
+
+/// A committed twenty-line file with line ten edited: one hunk, new lines 7-13.
+fn edited_fixture() -> PathBuf {
+    let unique = FIXTURES.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "grove-chat-findings-{}-{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("fixture root");
+    let repository = git2::Repository::init(&root).expect("repository init");
+    let lines = |edited: bool| -> String {
+        (1..=20)
+            .map(|line| match (line, edited) {
+                (10, true) => "ten, edited\n".to_string(),
+                _ => format!("line {line}\n"),
+            })
+            .collect()
+    };
+    std::fs::write(root.join("numbers.txt"), lines(false)).expect("write file");
+    let mut index = repository.index().expect("index");
+    index
+        .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+        .expect("stage");
+    index.write().expect("index write");
+    let tree = repository
+        .find_tree(index.write_tree().expect("tree"))
+        .expect("find tree");
+    let signature = git2::Signature::now("Grove test", "grove@example.com").expect("signature");
+    repository
+        .commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+        .expect("commit");
+    std::fs::write(root.join("numbers.txt"), lines(true)).expect("edit file");
+    std::fs::canonicalize(&root).expect("canonical fixture")
+}
+
+#[test]
+fn findings_outside_a_changed_hunk_are_dropped_and_counted() {
+    let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = isolate_store();
+    let project = edited_fixture();
+    let project_path = project.to_string_lossy().into_owned();
+    std::fs::write(
+        store.join("projects.json"),
+        serde_json::json!({ "projects": [project_path] }).to_string(),
+    )
+    .expect("register fixture");
+
+    let findings = serde_json::json!([
+        {"path": "numbers.txt", "startLine": 10, "endLine": 10, "severity": "P1",
+         "title": "Edited line", "detail": "The tenth line changed."},
+        {"path": "numbers.txt", "startLine": 19, "endLine": 19, "severity": "P0",
+         "title": "Untouched line", "detail": "Line 19 is not part of any hunk."},
+        {"path": "absent.txt", "startLine": 1, "endLine": 1, "severity": "P2",
+         "title": "No such change", "detail": "This file did not change."},
+    ]);
+    let answer = format!("One real issue.\n\n```findings\n{findings}\n```\n");
+    let recorder = serve_sequence(vec![openai_answer(&answer)]);
+    settings_for(recorder.base_url.clone());
+    let app = mock_app();
+
+    let (channel, done) = run_request(
+        &app,
+        ChatSendRequest {
+            turn_id: "turn-findings".to_string(),
+            text: "review this file".to_string(),
+            context: ChatContext {
+                project_path: Some(project_path.clone()),
+                file_path: Some("numbers.txt".to_string()),
+                files: Vec::new(),
+            },
+            action: None,
+        },
+    );
+    stop_recorder(recorder);
+    assert_eq!(channel, "grove://chat-done", "{done}");
+
+    let kept = done["message"]["findings"]
+        .as_array()
+        .expect("findings array");
+    assert_eq!(kept.len(), 1, "only the in-hunk finding survives: {done}");
+    assert_eq!(kept[0]["path"].as_str(), Some("numbers.txt"));
+    assert_eq!(kept[0]["startLine"].as_u64(), Some(10));
+    assert_eq!(kept[0]["severity"].as_str(), Some("P1"));
+    assert_eq!(kept[0]["projectPath"].as_str(), Some(project_path.as_str()));
+    assert_eq!(
+        done["message"]["droppedFindings"].as_u64(),
+        Some(2),
+        "the dropped findings are counted, not hidden: {done}"
+    );
+    let _ = std::fs::remove_dir_all(project);
+}
+
+#[test]
+fn a_turn_over_its_cost_cap_is_refused_before_anything_is_sent() {
+    let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    isolate_store();
+
+    let recorder = serve_sequence(Vec::new());
+    let mut settings = settings_for(recorder.base_url.clone());
+    settings.caps = CostCaps {
+        per_turn_tokens: Some(50),
+        per_session_tokens: None,
+        per_month_tokens: None,
+    };
+    save_chat_settings(&settings).expect("settings persist");
+    let app = mock_app();
+
+    let (channel, error) = run_request(&app, plain_request("turn-capped", "summarize everything"));
+    let bodies = stop_recorder(recorder);
+
+    assert_eq!(channel, "grove://chat-error", "{error}");
+    assert_eq!(error["turnId"].as_str(), Some("turn-capped"));
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("per-turn cap") && message.contains("50"),
+        "the refusal names the cap it hit: {message}"
+    );
+    assert!(
+        bodies.is_empty(),
+        "nothing reached the provider: {bodies:#?}"
+    );
+    let stored = grove_lib::chat::load_chat_history().expect("history readable");
+    assert!(stored.is_empty(), "a refused turn persists nothing");
+}
+
+#[test]
+fn an_identical_request_is_answered_from_the_summary_cache() {
+    let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    isolate_store();
+
+    let recorder = serve_sequence(vec![openai_answer("The repository is empty.")]);
+    let mut settings = settings_for(recorder.base_url.clone());
+    settings.summary_cache = true;
+    save_chat_settings(&settings).expect("settings persist");
+    let app = mock_app();
+
+    let summary = |turn_id: &str| ChatSendRequest {
+        turn_id: turn_id.to_string(),
+        text: "Explain this repository.".to_string(),
+        context: ChatContext::default(),
+        action: Some(QuickAction::ExplainRepo),
+    };
+    let (channel, first) = run_request(&app, summary("turn-fresh"));
+    assert_eq!(channel, "grove://chat-done", "{first}");
+    assert_eq!(first["message"]["cached"].as_bool(), Some(false));
+
+    let (channel, second) = run_request(&app, summary("turn-cached"));
+    let bodies = stop_recorder(recorder);
+    assert_eq!(channel, "grove://chat-done", "{second}");
+    assert_eq!(second["turnId"].as_str(), Some("turn-cached"));
+    assert_eq!(
+        second["message"]["cached"].as_bool(),
+        Some(true),
+        "a cache hit is marked: {second}"
+    );
+    assert_eq!(
+        second["message"]["text"].as_str(),
+        Some("The repository is empty.")
+    );
+    assert_eq!(bodies.len(), 1, "the repeat never reached the provider");
 }

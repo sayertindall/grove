@@ -88,18 +88,42 @@ pub struct StreamOutcome {
     pub total_tokens: Option<u64>,
 }
 
-/// Streams one model turn, forwarding events to `on`. Cancellation is checked on
-/// every chunk; a cancelled stream fails with a readable error.
-#[allow(clippy::too_many_arguments)]
-pub async fn stream_turn(
+/// One provider request, built before it is sent so the turn loop can measure,
+/// cap, and cache it by its exact body.
+#[derive(Debug, Clone)]
+pub struct ProviderRequest {
+    pub kind: ProviderKind,
+    pub url: String,
+    pub body: Value,
+}
+
+/// Builds the wire request for one model step.
+pub fn build_request(
     kind: ProviderKind,
     base_url: &str,
-    api_key: &str,
     model: &str,
     max_tokens: u32,
     temperature: Option<f64>,
     messages: &[TurnMessage],
     tools: &[ToolSpec],
+) -> ProviderRequest {
+    let (url, body) = match kind {
+        ProviderKind::OpenAiCompatible => {
+            openai_request(base_url, model, max_tokens, temperature, messages, tools)
+        }
+        ProviderKind::Anthropic => {
+            anthropic_request(base_url, model, max_tokens, temperature, messages, tools)
+        }
+    };
+    ProviderRequest { kind, url, body }
+}
+
+/// Streams one built request, forwarding events to `on`. Cancellation is checked
+/// on every chunk; a cancelled stream fails with a readable error. An empty key
+/// (a loopback server that needs none) sends no auth header.
+pub async fn stream_request(
+    request: &ProviderRequest,
+    api_key: &str,
     cancel: &AtomicBool,
     on: &(dyn Fn(ProviderEvent) + Send + Sync),
 ) -> Result<StreamOutcome, String> {
@@ -108,40 +132,24 @@ pub async fn stream_turn(
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|error| format!("http client: {error}"))?;
-
-    match kind {
+    let (url, body) = (request.url.as_str(), &request.body);
+    match request.kind {
         ProviderKind::OpenAiCompatible => {
-            let (url, body) =
-                openai_request(base_url, model, max_tokens, temperature, messages, tools);
+            let headers = if api_key.is_empty() {
+                Vec::new()
+            } else {
+                vec![("Authorization", format!("Bearer {api_key}"))]
+            };
             let mut adapter = OpenAiAdapter::default();
-            stream_sse(
-                &client,
-                url,
-                vec![("Authorization", format!("Bearer {api_key}"))],
-                body,
-                cancel,
-                &mut adapter,
-                on,
-            )
-            .await
+            stream_sse(&client, url, headers, body, cancel, &mut adapter, on).await
         }
         ProviderKind::Anthropic => {
-            let (url, body) =
-                anthropic_request(base_url, model, max_tokens, temperature, messages, tools);
+            let headers = vec![
+                ("x-api-key", api_key.to_string()),
+                ("anthropic-version", "2023-06-01".to_string()),
+            ];
             let mut adapter = AnthropicAdapter::default();
-            stream_sse(
-                &client,
-                url,
-                vec![
-                    ("x-api-key", api_key.to_string()),
-                    ("anthropic-version", "2023-06-01".to_string()),
-                ],
-                body,
-                cancel,
-                &mut adapter,
-                on,
-            )
-            .await
+            stream_sse(&client, url, headers, body, cancel, &mut adapter, on).await
         }
     }
 }
@@ -570,10 +578,7 @@ fn anthropic_request(
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens,
-        "messages": messages
-            .iter()
-            .filter_map(anthropic_message)
-            .collect::<Vec<_>>(),
+        "messages": merge_tool_results(messages.iter().filter_map(anthropic_message).collect()),
         "stream": true,
     });
     if !system.is_empty() {
@@ -593,6 +598,31 @@ fn anthropic_request(
             .collect::<Vec<_>>());
     }
     (anthropic_url(base_url), body)
+}
+
+/// Anthropic wants every tool_result of one round in the single user message
+/// that follows the assistant's tool_use blocks.
+fn merge_tool_results(messages: Vec<Value>) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for message in messages {
+        let joinable = is_tool_result(&message) && merged.last().is_some_and(is_tool_result);
+        match (joinable, merged.last_mut(), message["content"].as_array()) {
+            (true, Some(previous), Some(blocks)) => {
+                if let Some(content) = previous["content"].as_array_mut() {
+                    content.extend(blocks.iter().cloned());
+                }
+            }
+            _ => merged.push(message),
+        }
+    }
+    merged
+}
+
+fn is_tool_result(message: &Value) -> bool {
+    message["role"] == "user"
+        && message["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().all(|block| block["type"] == "tool_result"))
 }
 
 fn anthropic_message(message: &TurnMessage) -> Option<Value> {
@@ -640,9 +670,9 @@ fn anthropic_message(message: &TurnMessage) -> Option<Value> {
 /// end-of-stream ends the turn.
 async fn stream_sse<A: Adapter>(
     client: &reqwest::Client,
-    url: String,
+    url: &str,
     headers: Vec<(&str, String)>,
-    body: Value,
+    body: &Value,
     cancel: &AtomicBool,
     adapter: &mut A,
     on: &(dyn Fn(ProviderEvent) + Send + Sync),
@@ -651,7 +681,7 @@ async fn stream_sse<A: Adapter>(
         return Err("cancelled".to_string());
     }
 
-    let mut request = client.post(&url).json(&body);
+    let mut request = client.post(url).json(body);
     for (name, value) in headers {
         request = request.header(name, value);
     }

@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::error::GroveError;
+
 /// Depth of the directory the user picked. The walk visits depths 0 through
 /// `REPOSITORY_SCAN_MAX_DEPTH` inclusive, so a repository sitting at the limit is
 /// listed while its children are never entered.
@@ -13,11 +15,11 @@ pub fn directory_holds_git_metadata(directory: &Path) -> bool {
 
 /// Returns the canonical absolute paths of every directory at or below `root`
 /// that directly contains git metadata, sorted lexicographically.
-pub fn find_repositories(root: &Path, max_depth: u32) -> Result<Vec<String>, String> {
-    let metadata =
-        std::fs::metadata(root).map_err(|error| format!("{}: {error}", root.display()))?;
+pub fn find_repositories(root: &Path, max_depth: u32) -> Result<Vec<String>, GroveError> {
+    let display = root.display().to_string();
+    let metadata = std::fs::metadata(root).map_err(|error| GroveError::io(&display, error))?;
     if !metadata.is_dir() {
-        return Err(format!("{}: not a directory", root.display()));
+        return Err(GroveError::usage(format!("{display}: not a directory")));
     }
 
     let mut found = Vec::new();

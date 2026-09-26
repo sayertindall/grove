@@ -16,8 +16,7 @@ import {
   AutocompleteSeparator,
 } from "@/components/ui/autocomplete";
 
-export const CommandDialog: typeof CommandDialogPrimitive.Root =
-  CommandDialogPrimitive.Root;
+export const CommandDialog: typeof CommandDialogPrimitive.Root = CommandDialogPrimitive.Root;
 
 export const CommandDialogPortal: typeof CommandDialogPrimitive.Portal =
   CommandDialogPrimitive.Portal;
@@ -28,12 +27,7 @@ export const CommandCreateHandle: typeof CommandDialogPrimitive.createHandle =
 export function CommandDialogTrigger(
   props: CommandDialogPrimitive.Trigger.Props,
 ): React.ReactElement {
-  return (
-    <CommandDialogPrimitive.Trigger
-      data-slot="command-dialog-trigger"
-      {...props}
-    />
-  );
+  return <CommandDialogPrimitive.Trigger data-slot="command-dialog-trigger" {...props} />;
 }
 
 export function CommandDialogBackdrop({
@@ -43,7 +37,7 @@ export function CommandDialogBackdrop({
   return (
     <CommandDialogPrimitive.Backdrop
       className={cn(
-        "fixed inset-0 z-50 bg-black/32 backdrop-blur-sm transition-all duration-200 data-ending-style:opacity-0 data-starting-style:opacity-0",
+        "fixed inset-0 z-50 bg-black/55 transition-all duration-200 data-ending-style:opacity-0 data-starting-style:opacity-0",
         className,
       )}
       data-slot="command-dialog-backdrop"
@@ -178,13 +172,7 @@ export function CommandGroup({
   className,
   ...props
 }: React.ComponentProps<typeof AutocompleteGroup>): React.ReactElement {
-  return (
-    <AutocompleteGroup
-      className={className}
-      data-slot="command-group"
-      {...props}
-    />
-  );
+  return <AutocompleteGroup className={className} data-slot="command-group" {...props} />;
 }
 
 export function CommandGroupLabel({
@@ -192,11 +180,7 @@ export function CommandGroupLabel({
   ...props
 }: React.ComponentProps<typeof AutocompleteGroupLabel>): React.ReactElement {
   return (
-    <AutocompleteGroupLabel
-      className={className}
-      data-slot="command-group-label"
-      {...props}
-    />
+    <AutocompleteGroupLabel className={className} data-slot="command-group-label" {...props} />
   );
 }
 
@@ -207,11 +191,7 @@ export function CommandItem({
   ...props
 }: React.ComponentProps<typeof AutocompleteItem>): React.ReactElement {
   return (
-    <AutocompleteItem
-      className={cn("py-1.5", className)}
-      data-slot="command-item"
-      {...props}
-    />
+    <AutocompleteItem className={cn("py-1.5", className)} data-slot="command-item" {...props} />
   );
 }
 

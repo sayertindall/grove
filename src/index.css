@@ -13,6 +13,8 @@
     --font-heading: 'Inter', sans-serif;
     --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
     --font-sans: 'Inter', sans-serif;
+    --text-2xs: 11px;
+    --text-2xs--line-height: 16px;
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
     --color-sidebar-primary: var(--sidebar-primary);

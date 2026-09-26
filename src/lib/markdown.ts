@@ -23,7 +23,12 @@ export type Block =
     };
 
 /** `path/to/file.ts:12` and `path/to/file.ts:12-34` tokens in prose */
-const CITATION = /([A-Za-z0-9_./-]+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?/y;
+const CITATION_SOURCE = "([A-Za-z0-9_./-]+\\.[A-Za-z0-9]+):(\\d+)(?:-(\\d+))?";
+
+/** Global-flag variant for scanning prose outside this parser (chat answers). */
+export const INLINE_CITATION = new RegExp(CITATION_SOURCE, "g");
+
+const CITATION = new RegExp(CITATION_SOURCE, "y");
 
 const RULE = /^(?:\*{3,}|-{3,}|_{3,})$/;
 const BULLET = /^[-*+]\s+/;

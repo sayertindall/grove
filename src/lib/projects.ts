@@ -1,5 +1,6 @@
 import type { ProjectSort } from "@/lib/storage";
-import type { ProjectState, ProjectStatus } from "@/types/grove";
+import { triageScore } from "@/lib/triage";
+import type { ProjectState, ProjectStatus, RiskSignal } from "@/types/grove";
 
 export function dedupePaths(paths: readonly string[]): string[] {
   const seen = new Set<string>();
@@ -12,27 +13,40 @@ export function dedupePaths(paths: readonly string[]): string[] {
   return next;
 }
 
+/**
+ * The sidebar order: clean projects always follow the rest (they render in their
+ * own collapsed section), then `sort` decides. `triage` ranks by `triageScore`.
+ */
 export function visibleProjects(
   projects: readonly ProjectStatus[],
   sort: ProjectSort,
   hideClean: boolean,
+  risks: ReadonlyMap<string, readonly RiskSignal[]>,
 ): ProjectStatus[] {
-  const filtered = hideClean ? projects.filter((project) => project.state !== "clean") : [...projects];
-  if (sort === "stored") return filtered;
-
+  const filtered = hideClean ? projects.filter((project) => project.state !== "clean") : projects;
+  const score = (project: ProjectStatus) => triageScore(project, risks.get(project.path) ?? []);
   return filtered
     .map((project, index) => ({ project, index }))
     .sort((left, right) => {
-      if (sort === "dirty") {
+      const clean = cleanRank(left.project.state) - cleanRank(right.project.state);
+      if (clean !== 0) return clean;
+      if (sort === "triage") {
+        const byScore = score(right.project) - score(left.project);
+        if (byScore !== 0) return byScore;
+      } else if (sort === "dirty") {
         const rank = stateRank(left.project.state) - stateRank(right.project.state);
         if (rank !== 0) return rank;
-      } else {
+      } else if (sort === "name") {
         const byName = left.project.displayName.localeCompare(right.project.displayName);
         if (byName !== 0) return byName;
       }
       return left.index - right.index;
     })
     .map((entry) => entry.project);
+}
+
+function cleanRank(state: ProjectState): number {
+  return state === "clean" ? 1 : 0;
 }
 
 function stateRank(state: ProjectState): number {

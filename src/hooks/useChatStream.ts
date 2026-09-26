@@ -7,11 +7,12 @@ import {
   chatSend,
   listenForChatDelta,
   listenForChatDone,
+  listenForChatEgress,
   listenForChatError,
   listenForChatReasoning,
   listenForChatTool,
 } from "@/api/chat";
-import type { ChatContext, ChatMessage } from "@/types/grove";
+import type { ChatContext, ChatEgressEvent, ChatMessage, QuickAction } from "@/types/grove";
 
 /** Coalescing window for streamed text, in milliseconds. */
 const STREAM_FLUSH_MS = 50;
@@ -28,6 +29,9 @@ function userMessage(turnId: string, text: string): ChatMessage {
     model: null,
     createdAt: Date.now(),
     error: null,
+    cached: false,
+    findings: [],
+    droppedFindings: 0,
   };
 }
 
@@ -43,7 +47,17 @@ function assistantMessage(turnId: string): ChatMessage {
     model: null,
     createdAt: Date.now(),
     error: null,
+    cached: false,
+    findings: [],
+    droppedFindings: 0,
   };
+}
+
+/** What a turn was started with, so a retry repeats the same request. */
+interface TurnRequest {
+  text: string;
+  context: ChatContext;
+  action: QuickAction | null;
 }
 
 export function useChatStream() {
@@ -58,6 +72,9 @@ export function useChatStream() {
   messagesRef.current = messages;
   /** Turn ids whose two local messages exist only here, not yet in backend history. */
   const localTurnIdsRef = useRef<Set<string>>(new Set());
+  /** The live "sent so far" counter of the latest turn that sent anything. */
+  const [egress, setEgress] = useState<ChatEgressEvent | null>(null);
+  const lastRequestRef = useRef<TurnRequest | null>(null);
 
   /**
    * Patches the assistant message a turnId is streaming into. When the turn is
@@ -165,6 +182,10 @@ export function useChatStream() {
         if (!cancelled) setHistoryPending(false);
       });
 
+    void listenForChatEgress((event) => {
+      setEgress(event);
+    }).then(track);
+
     void listenForChatDelta((event) => {
       queueStream(event.turnId, event.text, "");
     }).then(track);
@@ -223,11 +244,13 @@ export function useChatStream() {
   }, [patchAssistant, settleTurn, queueStream, flushPending]);
 
   const startTurn = useCallback(
-    (turnId: string, text: string, context: ChatContext) => {
+    (turnId: string, { text, context, action }: TurnRequest) => {
       localTurnIdsRef.current.add(turnId);
+      lastRequestRef.current = { text, context, action };
       setMessages((current) => [...current, userMessage(turnId, text), assistantMessage(turnId)]);
       setActiveTurnId(turnId);
-      void chatSend({ turnId, text, context }).catch((error: unknown) => {
+      setEgress(null);
+      void chatSend({ turnId, text, context, action }).catch((error: unknown) => {
         // The command itself failed (no key, no network, refused egress). Events
         // may already have arrived, so only surface this onto a live, errorless
         // placeholder; and always settle so the panel stops spinning.
@@ -244,10 +267,10 @@ export function useChatStream() {
   );
 
   const send = useCallback(
-    (text: string, context: ChatContext) => {
+    (text: string, context: ChatContext, action: QuickAction | null = null) => {
       const trimmed = text.trim();
       if (trimmed === "" || activeTurnRef.current !== null) return;
-      startTurn(crypto.randomUUID(), trimmed, context);
+      startTurn(crypto.randomUUID(), { text: trimmed, context, action });
     },
     [startTurn],
   );
@@ -267,7 +290,7 @@ export function useChatStream() {
       });
   }, [settleTurn]);
 
-  /** Drops the failed answer and re-sends the last user turn. */
+  /** Drops the failed answer and re-sends the last user turn, action included. */
   const retry = useCallback(
     (context: ChatContext) => {
       if (activeTurnRef.current !== null) return;
@@ -276,7 +299,12 @@ export function useChatStream() {
         .find((message) => message.role === "user");
       if (lastUser === undefined) return;
       setMessages((current) => current.filter((message) => message.id !== lastUser.id));
-      startTurn(crypto.randomUUID(), lastUser.text, context);
+      const last = lastRequestRef.current;
+      const repeat =
+        last !== null && last.text === lastUser.text
+          ? last
+          : { text: lastUser.text, context, action: null };
+      startTurn(crypto.randomUUID(), repeat);
     },
     [startTurn],
   );
@@ -292,5 +320,15 @@ export function useChatStream() {
       });
   }, []);
 
-  return { messages, activeTurnId, historyPending, retryableIds, send, cancel, retry, clear };
+  return {
+    messages,
+    activeTurnId,
+    historyPending,
+    retryableIds,
+    egress,
+    send,
+    cancel,
+    retry,
+    clear,
+  };
 }

@@ -11,12 +11,26 @@ export const storageKeys = {
   hideClean: "grove.hideClean",
   chatOpen: "grove.chatOpen",
   chatWidth: "grove.chatWidth",
+  layoutMode: "grove.layoutMode",
+  streamFilter: "grove.streamFilter",
+  sidebarOpen: "grove.sidebarOpen",
+  lineDiffType: "grove.lineDiffType",
+  diffContext: "grove.diffContext",
+  imageMode: "grove.imageMode",
+  historyOpen: "grove.historyOpen",
 } as const;
 
 export type ThemePreference = "system" | "dark" | "light";
 export type DiffStyle = "unified" | "split";
 export type DiffOverflow = "wrap" | "scroll";
-export type ProjectSort = "stored" | "dirty" | "name";
+export type ProjectSort = "triage" | "stored" | "dirty" | "name";
+/**
+ * `stream`: every dirty project's changes in one list; `file`: one file at a time;
+ * `tour`: the files in reading order, one step at a time.
+ */
+export type LayoutMode = "stream" | "file" | "tour";
+export type StreamFilter = "all" | "unviewed";
+export type ImageMode = "2-up" | "swipe" | "onion" | "difference";
 
 export const SIDEBAR_WIDTH = { min: 180, max: 420, fallback: 240 } as const;
 export const TREE_WIDTH = { min: 180, max: 640, fallback: 280 } as const;

@@ -29,3 +29,6 @@ dist-ssr
 # the MIT notice. Safe to delete the directory once the port is verified.
 beautiful-ui/
 
+# Local coding-agent configuration for this checkout; not repository content.
+.omp/
+

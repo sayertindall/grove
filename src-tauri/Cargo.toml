@@ -15,7 +15,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon`: the menu-bar tray that lists dirty projects.
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
 git2 = "0.21"
@@ -29,14 +30,44 @@ tauri-plugin-window-state = "2"
 # AppHandle so the CLI subcommands can read the store outside a Tauri process.
 reqwest = { version = "0.13", features = ["json", "stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["sync", "time"] }
+# `rt` adds `JoinSet`, which bounds the parallel project reads of `list_projects`.
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 sha2 = "0.10"
 keyring = { version = "3", features = ["apple-native"] }
 dirs = "6"
+# Typed errors: `GroveError` derives Display/Error so the command boundary can send
+# `{ code, message, path }` and the CLI can pick exit codes by variant, not by text.
+thiserror = "2"
+# Distribution, all official Tauri plugins. single-instance (with its `deep-link`
+# feature) forwards a second launch — and the `grove://` URL it carries on
+# Windows/Linux — to the running app; deep-link registers the `grove` scheme;
+# global-shortcut toggles the window from anywhere; updater checks and installs
+# signed releases, only when the user asks.
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-updater = "2"
+# Decodes the path segments of a `grove://` URL; already in the tree through url.
+percent-encoding = "2"
+# `grove mcp`: the official MCP Rust SDK serves the chat's read-only tools over
+# stdio to external agents (Claude Code, Codex) without an HTTP listener.
+rmcp = { version = "3", default-features = false, features = ["server", "transport-io"] }
+# Triage: the credential patterns scanned over added lines; already in the tree.
+regex = "1"
+
+# The debug-only automation bridge renders the hidden webview with WebKit's
+# `takeSnapshotWithConfiguration` (an Objective-C block callback) and reads app
+# presence; objc2 and block2 are already in the tree through tauri/wry.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
 
 [dev-dependencies]
 # Enables tauri::test::mock_app for the watcher smoke test.
 tauri = { version = "2", features = ["test"] }
+# The menu accelerators are parsed with the exact parser tauri's menus use,
+# without building a native menu off the main thread in a test.
+muda = { version = "0.19", default-features = false }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

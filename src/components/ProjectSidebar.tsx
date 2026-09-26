@@ -1,52 +1,49 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowUpDownIcon, FolderIcon, PlusIcon, XIcon } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { ChevronDownIcon, ChevronRightIcon, FolderIcon, PlusIcon, XIcon } from "lucide-react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { scanForRepos, toError } from "@/api/grove";
+import { scanForRepos } from "@/api/grove";
+import { toError } from "@/api/invoke";
 import { PathContextItems } from "@/components/PathContextItems";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ContextMenu, ContextMenuPopup, ContextMenuTrigger } from "@/components/ui/context-menu";
-import {
-  Menu,
-  MenuPopup,
-  MenuRadioGroup,
-  MenuRadioItem,
-  MenuTrigger,
-} from "@/components/ui/menu";
+import { Menu, MenuPopup, MenuRadioGroup, MenuRadioItem, MenuTrigger } from "@/components/ui/menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
-import { buttonVariants } from "@/components/ui/button";
-import {
-  branchLabel,
-  commonParent,
-  disambiguatingPath,
-  pathName,
-  projectTitle,
-  visibleProjects,
-} from "@/lib/projects";
+import { RiskChips } from "@/components/RiskChips";
+import { commonParent, disambiguatingPath, pathName, projectTitle } from "@/lib/projects";
 import type { ProjectSort } from "@/lib/storage";
+import { dirtyCount, formatAge } from "@/lib/triage";
 import { cn } from "@/lib/utils";
-import type { ProjectState, ProjectStatus } from "@/types/grove";
+import type { ProjectState, ProjectStatus, RiskSignal } from "@/types/grove";
 
 const STATE_DOT: Record<ProjectState, string> = {
-  clean: "bg-muted-foreground/40",
+  // Shape carries the state as well as color: ring = clean, dot = dirty, diamond = broken.
+  clean: "border border-muted-foreground/60",
   dirty: "bg-warning",
-  missing: "bg-destructive",
-  unreadable: "bg-destructive",
+  missing: "rounded-none rotate-45 bg-destructive",
+  unreadable: "rounded-none rotate-45 bg-destructive",
 };
 
 const SORT_LABEL: Record<ProjectSort, string> = {
+  triage: "Triage",
   stored: "Stored order",
   dirty: "Dirty first",
   name: "Name",
 };
 
+const NO_RISKS: readonly RiskSignal[] = [];
+
 interface ProjectSidebarProps {
   projects: ProjectStatus[];
+  /** The ordered rows (clean ones last); computed once in App. */
+  visible: ProjectStatus[];
+  /** Distinct risk signals of each dirty project's changed files. */
+  risks: ReadonlyMap<string, readonly RiskSignal[]>;
   isPending: boolean;
   listError: string | null;
   mutationError: string | null;
@@ -64,6 +61,8 @@ interface ProjectSidebarProps {
 
 export function ProjectSidebar({
   projects,
+  visible,
+  risks,
   isPending,
   listError,
   mutationError,
@@ -84,6 +83,7 @@ export function ProjectSidebar({
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const rowRefs = useRef(new Map<string, HTMLButtonElement>());
+  const [cleanOpen, setCleanOpen] = useState(false);
 
   const chooseDirectory = async () => {
     setPickerError(null);
@@ -118,8 +118,19 @@ export function ProjectSidebar({
   const addable = (candidates ?? []).filter(
     (path) => !registered.has(path) && !declined.includes(path),
   );
-  const visible = visibleProjects(projects, sort, hideClean);
   const parent = commonParent(projects.map((project) => project.path));
+  const relativePaths = useMemo<Record<string, string | null>>(
+    () =>
+      Object.fromEntries(
+        projects.map((project) => [project.path, disambiguatingPath(project.path, parent)]),
+      ),
+    [projects, parent],
+  );
+
+  const handleRowRef = useCallback((path: string, node: HTMLButtonElement | null) => {
+    if (node === null) rowRefs.current.delete(path);
+    else rowRefs.current.set(path, node);
+  }, []);
 
   const moveSelection = (direction: -1 | 1) => {
     if (visible.length === 0) return;
@@ -136,29 +147,59 @@ export function ProjectSidebar({
     row?.scrollIntoView({ block: "nearest" });
   };
 
+  const renderRow = (project: ProjectStatus, index: number) => (
+    <li key={project.path}>
+      <ContextMenu>
+        <ContextMenuTrigger className="block w-full">
+          <ProjectRow
+            project={project}
+            slot={index < 9 ? index + 1 : null}
+            risks={risks.get(project.path) ?? NO_RISKS}
+            relativePath={relativePaths[project.path] ?? null}
+            isSelected={project.path === selectedPath}
+            onSelectProject={onSelectProject}
+            onRowRef={handleRowRef}
+          />
+        </ContextMenuTrigger>
+        <ContextMenuPopup align="start">
+          <PathContextItems path={project.path} onRemove={() => onRemoveProject(project.path)} />
+        </ContextMenuPopup>
+      </ContextMenu>
+    </li>
+  );
+  const firstClean = visible.findIndex((project) => project.state === "clean");
+  const active = firstClean === -1 ? visible : visible.slice(0, firstClean);
+  const clean = firstClean === -1 ? [] : visible.slice(firstClean);
+  const selectedIsClean = clean.some((project) => project.path === selectedPath);
+  const cleanShown = cleanOpen || selectedIsClean;
+  const CleanChevron = cleanShown ? ChevronDownIcon : ChevronRightIcon;
+
   return (
     <aside
+      aria-label="Projects"
       style={{ width }}
       className="flex h-full shrink-0 flex-col gap-1 bg-sidebar p-2 text-sidebar-foreground"
     >
       {candidates === null ? (
         <>
           <div className="flex h-8 shrink-0 items-center gap-1 px-2">
-            <span className="flex-1 text-xs font-medium">Projects</span>
+            <h2 className="flex-1 text-sm font-semibold text-foreground">Projects</h2>
             <Menu>
               <MenuTrigger
-                aria-label="Sort projects"
-                className={buttonVariants({ variant: "ghost", size: "icon-xs" })}
+                aria-label={`Sort projects: ${SORT_LABEL[sort]}`}
+                className="flex h-6 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground hover:bg-sidebar-accent"
               >
-                <ArrowUpDownIcon />
+                {SORT_LABEL[sort]}
+                <ChevronDownIcon size={12} />
               </MenuTrigger>
               <MenuPopup align="end">
                 <MenuRadioGroup
                   value={sort}
                   onValueChange={(value) => {
-                    if (value === "stored" || value === "dirty" || value === "name") {
-                      onSortChange(value);
-                    }
+                    const option = (Object.keys(SORT_LABEL) as ProjectSort[]).find(
+                      (candidate) => candidate === value,
+                    );
+                    if (option !== undefined) onSortChange(option);
                   }}
                 >
                   {(Object.keys(SORT_LABEL) as ProjectSort[]).map((option) => (
@@ -207,33 +248,28 @@ export function ProjectSidebar({
                   moveSelection(event.key === "ArrowDown" ? 1 : -1);
                 }}
               >
-                {visible.map((project) => (
-                  <li key={project.path}>
-                    <ContextMenu>
-                      <ContextMenuTrigger className="block w-full">
-                        <ProjectRow
-                          project={project}
-                          relativePath={disambiguatingPath(project.path, parent)}
-                          isSelected={project.path === selectedPath}
-                          onSelect={() => onSelectProject(project.path)}
-                          rowRef={(node) => {
-                            if (node === null) rowRefs.current.delete(project.path);
-                            else rowRefs.current.set(project.path, node);
-                          }}
-                        />
-                      </ContextMenuTrigger>
-                      <ContextMenuPopup align="start">
-                        <PathContextItems
-                          path={project.path}
-                          onRemove={() => onRemoveProject(project.path)}
-                        />
-                      </ContextMenuPopup>
-                    </ContextMenu>
-                  </li>
-                ))}
-                {visible.length === 0 && projects.length > 0 ? (
+                {active.map(renderRow)}
+                {active.length === 0 && projects.length > 0 ? (
                   <li className="px-2 py-1 text-[11px] text-muted-foreground">No dirty projects</li>
                 ) : null}
+                {clean.length > 0 ? (
+                  <li>
+                    <button
+                      type="button"
+                      aria-expanded={cleanShown}
+                      onClick={() => setCleanOpen(!cleanShown)}
+                      className="flex w-full items-center gap-2 px-2 pt-3.5 pb-1.5 text-muted-foreground"
+                    >
+                      <CleanChevron size={10} className="shrink-0" />
+                      <span className="text-[10px] font-semibold tracking-wide">CLEAN</span>
+                      <span className="h-px flex-1 bg-border" />
+                      <span className="font-mono text-[11px]">{clean.length}</span>
+                    </button>
+                  </li>
+                ) : null}
+                {cleanShown
+                  ? clean.map((project, index) => renderRow(project, active.length + index))
+                  : null}
               </ul>
             )}
           </ScrollArea>
@@ -389,42 +425,82 @@ function AddProjects({
 
 interface ProjectRowProps {
   project: ProjectStatus;
+  /** The ⌘1–⌘9 slot, for the first nine rows. */
+  slot: number | null;
+  risks: readonly RiskSignal[];
   relativePath: string | null;
   isSelected: boolean;
-  onSelect: () => void;
-  rowRef: (node: HTMLButtonElement | null) => void;
+  onSelectProject: (path: string) => void;
+  onRowRef: (path: string, node: HTMLButtonElement | null) => void;
 }
 
-function ProjectRow({ project, relativePath, isSelected, onSelect, rowRef }: ProjectRowProps) {
-  const label = branchLabel(project);
-  const broken = project.state === "missing" || project.state === "unreadable";
+/** `14 dirty · 12m · agent: claude`, then whatever else sets the row apart. */
+function rowFacts(project: ProjectStatus, relativePath: string | null): string[] {
   const ahead = project.branch?.ahead ?? 0;
   const behind = project.branch?.behind ?? 0;
+  const facts = [
+    project.state === "dirty" ? `${dirtyCount(project)} dirty` : null,
+    project.state === "dirty" && project.dirtyAgeSeconds !== null
+      ? formatAge(project.dirtyAgeSeconds)
+      : null,
+    project.agent !== null ? `agent: ${project.agent}` : null,
+    relativePath,
+    ahead > 0 ? `↑${ahead}` : null,
+    behind > 0 ? `↓${behind}` : null,
+    project.worktreeOf !== null ? `worktree of ${pathName(project.worktreeOf)}` : null,
+    project.watching ? null : "not watching",
+  ];
+  return facts.filter((fact): fact is string => fact !== null);
+}
+
+const ProjectRow = memo(function ProjectRow({
+  project,
+  slot,
+  risks,
+  relativePath,
+  isSelected,
+  onSelectProject,
+  onRowRef,
+}: ProjectRowProps) {
+  const broken = project.state === "missing" || project.state === "unreadable";
+  const clean = project.state === "clean";
+  const facts = rowFacts(project, relativePath);
 
   return (
     <button
-      ref={rowRef}
+      ref={(node) => onRowRef(project.path, node)}
       type="button"
       title={projectTitle(project)}
       aria-current={isSelected ? "true" : undefined}
-      onClick={onSelect}
+      onClick={() => onSelectProject(project.path)}
       className={cn(
-        "flex w-full cursor-pointer flex-col gap-0.5 rounded-lg p-2 text-left outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring",
+        "flex w-full cursor-pointer flex-col gap-1 rounded-lg px-2 text-left outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring",
+        clean ? "py-1" : "py-2",
         isSelected && "bg-sidebar-accent",
       )}
     >
-      <span className="flex w-full items-center gap-1.5">
-        <span className={cn("size-1.5 shrink-0 rounded-full", STATE_DOT[project.state])} />
+      <span className="flex w-full items-center gap-2">
+        <span className="w-3 shrink-0 text-right font-mono text-[11px] text-muted-foreground">
+          {slot ?? ""}
+        </span>
+        <span
+          aria-hidden="true"
+          className={cn("size-1.5 shrink-0 rounded-full", STATE_DOT[project.state])}
+        />
+        <span className="sr-only">{project.state}, </span>
         <span
           className={cn(
-            "min-w-0 flex-1 truncate text-[13px] font-medium",
-            isSelected ? "text-sidebar-accent-foreground" : "text-sidebar-foreground",
+            "min-w-0 flex-1 truncate text-[13px]",
+            clean ? "text-muted-foreground" : "font-medium",
+            !clean && (isSelected ? "text-sidebar-accent-foreground" : "text-sidebar-foreground"),
           )}
         >
           {project.displayName}
         </span>
         {project.additions > 0 ? (
-          <span className="font-mono text-[11px] text-success-foreground">+{project.additions}</span>
+          <span className="font-mono text-[11px] text-success-foreground">
+            +{project.additions}
+          </span>
         ) : null}
         {project.deletions > 0 ? (
           <span className="font-mono text-[11px] text-destructive-foreground">
@@ -433,17 +509,13 @@ function ProjectRow({ project, relativePath, isSelected, onSelect, rowRef }: Pro
         ) : null}
       </span>
 
-      <span className="flex w-full min-w-0 items-center gap-1.5 truncate text-[11px] text-muted-foreground">
-        {relativePath !== null ? <span className="truncate">{relativePath}</span> : null}
-        {label !== null ? <span className="truncate">{label}</span> : null}
-        {ahead > 0 ? <span className="shrink-0">↑{ahead}</span> : null}
-        {behind > 0 ? <span className="shrink-0">↓{behind}</span> : null}
-        {project.worktreeOf !== null ? (
-          <span className="truncate">worktree of {pathName(project.worktreeOf)}</span>
-        ) : null}
-        {!project.watching ? <span className="shrink-0">not watching</span> : null}
-        {broken ? <span className="shrink-0 text-destructive">{project.state}</span> : null}
-      </span>
+      {facts.length > 0 || broken ? (
+        <span className="flex w-full min-w-0 items-center gap-1.5 truncate pl-[26px] text-[11px] text-muted-foreground">
+          <span className="truncate">{facts.join(" · ")}</span>
+          {broken ? <span className="shrink-0 text-destructive">{project.state}</span> : null}
+        </span>
+      ) : null}
+      {risks.length > 0 ? <RiskChips risks={risks} className="pl-[26px]" /> : null}
     </button>
   );
-}
+});

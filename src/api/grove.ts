@@ -1,29 +1,19 @@
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { invokeCommand, toError } from "@/api/invoke";
 import type {
+  BlameView,
+  CommitInfo,
+  DiffContext,
   DiffView,
   FileDiff,
   ProjectChanges,
   ProjectsChanged,
   ProjectStatus,
+  ReviewedFile,
 } from "@/types/grove";
 
 export const PROJECTS_CHANGED_EVENT = "grove://projects-changed";
-
-export function toError(error: unknown): Error {
-  if (error instanceof Error) return error;
-  if (typeof error === "string") return new Error(error);
-  return new Error("Something went wrong");
-}
-
-async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  try {
-    return await invoke<T>(command, args);
-  } catch (error) {
-    throw toError(error);
-  }
-}
 
 /** Repositories that directly contain git metadata, at most six levels down. */
 export function scanForRepos(dir: string): Promise<string[]> {
@@ -53,18 +43,20 @@ export function listChanges(
   return invokeCommand<ProjectChanges>("list_changes", { projectPath, ignoreWhitespace });
 }
 
-/** One file's two sides for the requested view. */
+/** One file's two sides for the requested view, with `context` unchanged lines per hunk. */
 export function getFileDiff(
   projectPath: string,
   filePath: string,
   view: DiffView,
   ignoreWhitespace: boolean,
+  context: DiffContext,
 ): Promise<FileDiff> {
   return invokeCommand<FileDiff>("get_file_diff", {
     projectPath,
     filePath,
     view,
     ignoreWhitespace,
+    context,
   });
 }
 
@@ -74,6 +66,35 @@ export function revealInFinder(path: string): Promise<void> {
 
 export function openPath(path: string): Promise<void> {
   return invokeCommand<void>("open_path", { path });
+}
+
+/** The file's current text (first 400 lines) beside the commit behind each line. */
+export function blameFile(projectPath: string, filePath: string): Promise<BlameView> {
+  return invokeCommand<BlameView>("blame_file", { projectPath, filePath });
+}
+
+/** Commits that touched one file, newest first; the backend caps `limit` at 50. */
+export function fileHistory(
+  projectPath: string,
+  filePath: string,
+  limit: number,
+): Promise<CommitInfo[]> {
+  return invokeCommand<CommitInfo[]>("file_history", { projectPath, filePath, limit });
+}
+
+/** The files of one project marked viewed, each with the content hash it was marked at. */
+export function listReviewed(projectPath: string): Promise<ReviewedFile[]> {
+  return invokeCommand<ReviewedFile[]>("list_reviewed", { projectPath });
+}
+
+/** Marks (or unmarks) one file viewed at its current `contentHash`. */
+export function setReviewed(
+  projectPath: string,
+  filePath: string,
+  contentHash: string,
+  reviewed: boolean,
+): Promise<void> {
+  return invokeCommand<void>("set_reviewed", { projectPath, filePath, contentHash, reviewed });
 }
 
 /** The one event Grove emits, after the watcher debounce. */

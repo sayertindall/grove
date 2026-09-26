@@ -2,10 +2,19 @@
 //! shared by the GUI (Tauri events) and the CLI (stdout). One free-flowing chat,
 //! one system prompt, no modes.
 
+pub mod ambient;
 pub mod cli;
+pub mod cost_caps;
+pub mod findings;
+pub mod installed_cli;
+pub mod preview;
 pub mod prompt;
 pub mod provider;
+pub mod replay;
+pub mod summary_cache;
 pub mod tools;
+pub mod turn_loop;
+pub mod turn_plan;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -15,15 +24,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::chat::prompt::system_prompt;
-use crate::chat::provider::{
-    stream_turn, CompletedToolCall, ProviderKind, StreamOutcome, ToolSpec, TurnMessage,
-};
-use crate::chat::tools::{run_tool, tool_specs, ToolCallRequest, ToolContext, ToolOutcome};
+use crate::chat::findings::ChatFinding;
+use crate::chat::provider::ProviderKind;
+use crate::chat::replay::ReplayStep;
 use crate::git::read_project_status;
+
+pub use crate::chat::cost_caps::CostCaps;
+pub use crate::chat::preview::{preview_turn, ChatPreview};
 
 /// The store files this module owns, relative to the data directory.
 pub const HISTORY_FILE: &str = "chat-history.json";
@@ -92,6 +101,27 @@ pub struct ChatMessage {
     pub created_at: u64,
     #[serde(default)]
     pub error: Option<String>,
+    /// Answered from the summary cache instead of the provider.
+    #[serde(default)]
+    pub cached: bool,
+    /// Findings that fall inside a changed hunk of the file they name.
+    #[serde(default)]
+    pub findings: Vec<ChatFinding>,
+    /// Findings the model emitted that could not be tied to a hunk.
+    #[serde(default)]
+    pub dropped_findings: u32,
+    /// The assistant's tool rounds, kept on disk so a later turn can replay them
+    /// in provider format. Never sent to the webview (see `for_webview`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replay: Vec<ReplayStep>,
+}
+
+impl ChatMessage {
+    /// The message as the panel sees it: tool payloads stay on disk.
+    pub fn for_webview(mut self) -> Self {
+        self.replay = Vec::new();
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,15 +130,36 @@ pub enum ProviderKindWire {
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
     Anthropic,
+    /// A locally installed agent CLI (`claude` or `codex`) that answers with its
+    /// own authentication; Grove's tool loop is off for it.
+    Cli,
 }
 
-impl From<ProviderKindWire> for ProviderKind {
-    fn from(value: ProviderKindWire) -> Self {
-        match value {
-            ProviderKindWire::OpenAiCompatible => ProviderKind::OpenAiCompatible,
-            ProviderKindWire::Anthropic => ProviderKind::Anthropic,
-        }
+/// The HTTP wire protocol for a provider; `None` for a delegated CLI.
+pub fn provider_kind(provider: ProviderKindWire) -> Option<ProviderKind> {
+    match provider {
+        ProviderKindWire::OpenAiCompatible => Some(ProviderKind::OpenAiCompatible),
+        ProviderKindWire::Anthropic => Some(ProviderKind::Anthropic),
+        ProviderKindWire::Cli => None,
     }
+}
+
+/// Which installed CLI a `cli` provider delegates to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CliCommand {
+    #[default]
+    Claude,
+    Codex,
+}
+
+/// A local model server `codex --oss` can use; with one set the CLI never
+/// leaves the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalModelServer {
+    Ollama,
+    Lmstudio,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +171,16 @@ pub struct ChatSettings {
     pub max_tokens: u32,
     pub temperature: Option<f64>,
     pub allow_cloud_egress: bool,
+    pub cli_command: CliCommand,
+    pub cli_local_server: Option<LocalModelServer>,
+    /// Projects that never reach a cloud provider: a turn about one is refused
+    /// and they are left out of the manifest and the tools.
+    pub never_send: Vec<String>,
+    /// Show the pre-send sheet before a turn leaves the machine.
+    pub preview_before_send: bool,
+    pub caps: CostCaps,
+    /// Reuse the stored answer for a byte-identical request.
+    pub summary_cache: bool,
 }
 
 impl Default for ChatSettings {
@@ -131,6 +192,12 @@ impl Default for ChatSettings {
             max_tokens: 8192,
             temperature: None,
             allow_cloud_egress: false,
+            cli_command: CliCommand::default(),
+            cli_local_server: None,
+            never_send: Vec::new(),
+            preview_before_send: true,
+            caps: CostCaps::default(),
+            summary_cache: false,
         }
     }
 }
@@ -140,6 +207,20 @@ impl Default for ChatSettings {
 pub struct ChatContext {
     pub project_path: Option<String>,
     pub file_path: Option<String>,
+    /// Files a quick action names explicitly (e.g. changed since last viewed).
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// A templated turn from the panel's quick-action row. The user text is the
+/// template; the action decides what ambient snapshot travels with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QuickAction {
+    ExplainFile,
+    ExplainRepo,
+    SinceLastViewed,
+    DraftCommitMessage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,12 +230,26 @@ pub struct ChatSendRequest {
     pub text: String,
     #[serde(default)]
     pub context: ChatContext,
+    #[serde(default)]
+    pub action: Option<QuickAction>,
 }
 
 /// The one sink both frontends implement.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum ChatEvent {
+    /// One request is about to leave: its size and the running total this turn.
+    Egress {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        #[serde(rename = "requestBytes")]
+        request_bytes: u64,
+        #[serde(rename = "sentBytes")]
+        sent_bytes: u64,
+        #[serde(rename = "estimatedTokens")]
+        estimated_tokens: u64,
+        loopback: bool,
+    },
     Delta {
         #[serde(rename = "turnId")]
         turn_id: String,
@@ -212,12 +307,12 @@ pub fn data_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "could not locate the application data directory".to_string())
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-fn write_json(path: &std::path::Path, value: &impl Serialize) -> Result<(), String> {
+pub(crate) fn write_json(path: &std::path::Path, value: &impl Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("{}: {error}", parent.display()))?;
@@ -296,6 +391,9 @@ pub fn load_registered_projects() -> Result<Vec<String>, String> {
     fn missing_key() -> Option<Vec<String>> {
         None
     }
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
     let store: Store = read_json(&path)
         .ok_or_else(|| format!("{}: not a readable projects store", path.display()))?;
     Ok(store.projects.unwrap_or_default())
@@ -323,18 +421,20 @@ fn provider_env_var(provider: ProviderKindWire, base_url: &str) -> &'static str 
 }
 
 /// Resolves the provider key: `GROVE_CHAT_KEY` → provider env var → Keychain.
-/// The key never reaches a log or a command result.
+/// The key never reaches a log or a command result. A delegated CLI uses its
+/// own login and gets "". A loopback server needs no key: it gets an env key
+/// when one is set, else "", and the Keychain (holding cloud keys) is never read
+/// for it.
 pub fn resolve_api_key(provider: ProviderKindWire, base_url: &str) -> Result<String, String> {
-    if let Ok(key) = std::env::var("GROVE_CHAT_KEY") {
-        if !key.trim().is_empty() {
-            return Ok(key);
-        }
+    if provider == ProviderKindWire::Cli {
+        return Ok(String::new());
     }
     let env_name = provider_env_var(provider, base_url);
-    if let Ok(key) = std::env::var(env_name) {
-        if !key.trim().is_empty() {
-            return Ok(key);
-        }
+    if let Some(key) = env_api_key(env_name) {
+        return Ok(key);
+    }
+    if turn_plan::is_loopback_url(base_url) {
+        return Ok(String::new());
     }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, provider_id(provider))
         .map_err(|error| format!("keychain: {error}"))?;
@@ -344,6 +444,13 @@ pub fn resolve_api_key(provider: ProviderKindWire, base_url: &str) -> Result<Str
         Err(keyring::Error::NoEntry) => missing_key_error(env_name),
         Err(error) => Err(format!("keychain: {error}")),
     }
+}
+
+fn env_api_key(env_name: &str) -> Option<String> {
+    ["GROVE_CHAT_KEY", env_name]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|key| !key.trim().is_empty())
 }
 
 fn missing_key_error(env_name: &str) -> Result<String, String> {
@@ -356,6 +463,7 @@ fn provider_id(provider: ProviderKindWire) -> &'static str {
     match provider {
         ProviderKindWire::OpenAiCompatible => "openai-compatible",
         ProviderKindWire::Anthropic => "anthropic",
+        ProviderKindWire::Cli => "cli",
     }
 }
 
@@ -388,7 +496,7 @@ pub fn chat_key_status(provider: ProviderKindWire, base_url: &str) -> bool {
 static CANCEL_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn register_turn(turn_id: &str) -> Arc<AtomicBool> {
+pub(crate) fn register_turn(turn_id: &str) -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     if let Ok(mut registry) = CANCEL_REGISTRY.lock() {
         registry.retain(|_, flag| !flag.load(Ordering::Relaxed));
@@ -405,30 +513,6 @@ pub fn cancel_turn(turn_id: &str) {
             flag.store(true, Ordering::Relaxed);
         }
     }
-}
-
-// --- Egress guard ---------------------------------------------------------------
-
-/// Refuses a turn when cloud egress is not allowed and the provider is remote.
-pub fn ensure_egress_allowed(settings: &ChatSettings) -> Result<(), String> {
-    let host = host_of(&settings.base_url);
-    let local = matches!(
-        host.as_deref(),
-        Some("127.0.0.1") | Some("localhost") | Some("::1")
-    );
-    if !local && !settings.allow_cloud_egress {
-        return Err(format!(
-            "cloud egress is off; allow it in chat settings before using {}",
-            host.as_deref().unwrap_or(settings.base_url.as_str())
-        ));
-    }
-    Ok(())
-}
-
-fn host_of(base_url: &str) -> Option<String> {
-    reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
 }
 
 // --- Turn loop ------------------------------------------------------------------
@@ -452,7 +536,7 @@ pub async fn send_turn_with_projects(
     request: ChatSendRequest,
 ) -> Result<ChatMessage, String> {
     let turn_id = request.turn_id.clone();
-    let result = run_turn(Arc::clone(&sink), settings, projects_override, request).await;
+    let result = turn_loop::run_turn(Arc::clone(&sink), settings, projects_override, request).await;
     if let Err(error) = &result {
         sink.emit(&ChatEvent::Error {
             turn_id,
@@ -463,404 +547,11 @@ pub async fn send_turn_with_projects(
     result
 }
 
-/// The loop itself: streams the model, runs the tools it asks for, persists the
-/// pair, and reports the final message. Every failure leaves as `Err`, so the
-/// caller reports it on the turn's error channel instead of leaving the panel
-/// waiting for an answer that will never come.
-async fn run_turn(
-    sink: Arc<dyn ChatSink>,
-    settings: ChatSettings,
-    projects_override: Option<Vec<String>>,
-    request: ChatSendRequest,
-) -> Result<ChatMessage, String> {
-    let turn_id = request.turn_id.clone();
-    let cancel = register_turn(&turn_id);
-    let PreparedTurn {
-        messages,
-        specs,
-        context,
-        api_key,
-    } = prepare_turn(&settings, projects_override, &request)?;
-    let mut state = TurnState::new(messages);
-
-    for iteration in 0..MAX_TOOL_ITERATIONS {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".to_string());
-        }
-        let outcome = stream_step(
-            &sink,
-            &turn_id,
-            &settings,
-            &state.messages,
-            &specs,
-            &api_key,
-            &cancel,
-        )
-        .await?;
-        state.absorb(&outcome);
-        if outcome.calls.is_empty() {
-            break;
-        }
-        if iteration + 1 == MAX_TOOL_ITERATIONS {
-            state.note_limit(outcome.calls.len(), &sink, &turn_id);
-            break;
-        }
-        state.messages.push(TurnMessage::Assistant {
-            text: outcome.text.clone(),
-            calls: outcome.calls.clone(),
-        });
-        execute_calls(
-            &sink,
-            &turn_id,
-            &context,
-            &cancel,
-            &mut state,
-            &outcome.calls,
-        )
-        .await;
-    }
-
-    finish_turn(sink, settings, request, state).await
-}
-
-/// Everything one turn needs before the first request: validated settings,
-/// history, tool specs, and the shared tool context.
-struct PreparedTurn {
-    messages: Vec<TurnMessage>,
-    specs: Vec<ToolSpec>,
-    context: Arc<ToolContext>,
-    api_key: String,
-}
-
-fn prepare_turn(
-    settings: &ChatSettings,
-    projects_override: Option<Vec<String>>,
-    request: &ChatSendRequest,
-) -> Result<PreparedTurn, String> {
-    if request.text.trim().is_empty() {
-        return Err("the message was empty".to_string());
-    }
-    ensure_egress_allowed(settings)?;
-    let stored = match projects_override {
-        Some(projects) => projects,
-        None => load_registered_projects()?,
-    };
-    let projects = dedupe_projects(&stored);
-    let api_key = resolve_api_key(settings.provider, &settings.base_url)?;
-
-    let manifest = build_manifest(&projects);
-    let system = system_prompt(&manifest, &request.context);
-    let history = load_chat_history()?;
-    let mut messages = replay_history(&history);
-    messages.insert(0, TurnMessage::System(system));
-    messages.push(TurnMessage::User(request.text.clone()));
-
-    Ok(PreparedTurn {
-        messages,
-        specs: tool_specs()
-            .into_iter()
-            .map(|(name, description, parameters)| ToolSpec {
-                name,
-                description,
-                parameters,
-            })
-            .collect(),
-        context: Arc::new(ToolContext {
-            projects: projects.clone(),
-        }),
-        api_key,
-    })
-}
-
-/// Stored history keeps no tool-result payloads, so assistant rows replay as
-/// plain text: replaying calls without their results would violate every
-/// provider's contract.
-fn replay_history(history: &[ChatMessage]) -> Vec<TurnMessage> {
-    history
-        .iter()
-        .map(|message| match message.role {
-            ChatRole::User => TurnMessage::User(message.text.clone()),
-            ChatRole::Assistant => TurnMessage::Assistant {
-                text: message.text.clone(),
-                calls: Vec::new(),
-            },
-        })
-        .collect()
-}
-
-/// Streams one model response, forwarding text and reasoning to the sink.
-#[allow(clippy::too_many_arguments)]
-async fn stream_step(
-    sink: &Arc<dyn ChatSink>,
-    turn_id: &str,
-    settings: &ChatSettings,
-    messages: &[TurnMessage],
-    specs: &[ToolSpec],
-    api_key: &str,
-    cancel: &Arc<AtomicBool>,
-) -> Result<StreamOutcome, String> {
-    let sink = Arc::clone(sink);
-    let turn_key = turn_id.to_string();
-    stream_turn(
-        settings.provider.into(),
-        &settings.base_url,
-        api_key,
-        &settings.model,
-        settings.max_tokens,
-        settings.temperature,
-        messages,
-        specs,
-        cancel,
-        &move |event| match event {
-            provider::ProviderEvent::TextDelta(delta) => sink.emit(&ChatEvent::Delta {
-                turn_id: turn_key.clone(),
-                text: delta,
-            }),
-            provider::ProviderEvent::ReasoningDelta(delta) => sink.emit(&ChatEvent::Reasoning {
-                turn_id: turn_key.clone(),
-                text: delta,
-            }),
-            provider::ProviderEvent::ToolCall { .. }
-            | provider::ProviderEvent::Done { .. }
-            | provider::ProviderEvent::Error(_) => {}
-        },
-    )
-    .await
-}
-
-/// The running answer plus everything the turn accumulates.
-struct TurnState {
-    messages: Vec<TurnMessage>,
-    text: String,
-    reasoning: String,
-    runs: Vec<ChatToolRun>,
-    total_tokens: Option<u64>,
-}
-
-impl TurnState {
-    fn new(messages: Vec<TurnMessage>) -> Self {
-        TurnState {
-            messages,
-            text: String::new(),
-            reasoning: String::new(),
-            runs: Vec::new(),
-            total_tokens: None,
-        }
-    }
-
-    fn absorb(&mut self, outcome: &StreamOutcome) {
-        self.text.push_str(&outcome.text);
-        self.reasoning.push_str(&outcome.reasoning);
-        if outcome.total_tokens.is_some() {
-            self.total_tokens = outcome.total_tokens;
-        }
-    }
-
-    /// A model that hit the tool cap still asked for tools; say so instead of
-    /// silently dropping its requests.
-    fn note_limit(&mut self, pending: usize, sink: &Arc<dyn ChatSink>, turn_id: &str) {
-        let note = format!(
-            "\n\n(Stopped after {MAX_TOOL_ITERATIONS} tool rounds; {pending} requested \
-             tool call(s) were not run.)"
-        );
-        sink.emit(&ChatEvent::Delta {
-            turn_id: turn_id.to_string(),
-            text: note.clone(),
-        });
-        self.text.push_str(&note);
-    }
-}
-
-/// Runs every tool call the model asked for, appending results to the messages.
-/// A failed tool reports its error to the model and the panel, and the turn goes on.
-async fn execute_calls(
-    sink: &Arc<dyn ChatSink>,
-    turn_id: &str,
-    context: &Arc<ToolContext>,
-    cancel: &Arc<AtomicBool>,
-    state: &mut TurnState,
-    calls: &[CompletedToolCall],
-) {
-    for call in calls {
-        let running = ChatToolRun {
-            call_id: call.id.clone(),
-            name: call.name.clone(),
-            status: ChatToolStatus::Running,
-            detail: tool_detail(call),
-            sources: Vec::new(),
-        };
-        sink.emit(&ChatEvent::Tool {
-            turn_id: turn_id.to_string(),
-            tool: running.clone(),
-        });
-        if cancel.load(Ordering::Relaxed) {
-            state.runs.push(running);
-            return;
-        }
-
-        let request = ToolCallRequest {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            arguments: call.arguments.clone(),
-        };
-        let tool_context = Arc::clone(context);
-        let executed = crate::commands::blocking(move || run_tool(&tool_context, &request)).await;
-
-        let finished = finish_tool_run(&running, executed);
-        sink.emit(&ChatEvent::Tool {
-            turn_id: turn_id.to_string(),
-            tool: finished.run.clone(),
-        });
-        state.runs.push(finished.run.clone());
-        state.messages.push(TurnMessage::ToolResult {
-            call_id: call.id.clone(),
-            name: call.name.clone(),
-            content: finished.content,
-        });
-    }
-}
-
-/// A completed run plus the bounded text the model sees.
-struct FinishedToolRun {
-    run: ChatToolRun,
-    content: String,
-}
-
-fn finish_tool_run(
-    running: &ChatToolRun,
-    executed: Result<ToolOutcome, String>,
-) -> FinishedToolRun {
-    let (content, sources, status) = match executed {
-        Ok(outcome) => (
-            cap_tool_result(outcome.content),
-            outcome.sources,
-            ChatToolStatus::Ok,
-        ),
-        Err(error) => (error_payload(&error), Vec::new(), ChatToolStatus::Error),
-    };
-    FinishedToolRun {
-        run: ChatToolRun {
-            call_id: running.call_id.clone(),
-            name: running.name.clone(),
-            status,
-            detail: running.detail.clone(),
-            sources,
-        },
-        content,
-    }
-}
-
-/// Tool errors travel as valid JSON so the provider always parses the result.
-fn error_payload(error: &str) -> String {
-    serde_json::to_string(&json!({ "error": error })).unwrap_or_else(|_| {
-        "{\"error\": \"the tool failed and its error could not be serialized\"}".to_string()
-    })
-}
-
-/// Nothing a tool read may exceed the text bound, even if a reader regresses.
-fn cap_tool_result(content: String) -> String {
-    let bound = crate::git::MAX_TEXT_SIDE_BYTES as usize;
-    if content.len() <= bound {
-        return content;
-    }
-    format!("{{\"truncated\": true, \"note\": \"tool result exceeded {bound} bytes and was cut\"}}")
-}
-
-/// Builds the final assistant message, persists the pair, and reports `Done`.
-async fn finish_turn(
-    sink: Arc<dyn ChatSink>,
-    settings: ChatSettings,
-    request: ChatSendRequest,
-    state: TurnState,
-) -> Result<ChatMessage, String> {
-    let message = ChatMessage {
-        id: new_message_id(&state.text),
-        role: ChatRole::Assistant,
-        text: state.text,
-        reasoning: state.reasoning,
-        tools: state.runs.clone(),
-        citations: dedup_citations(&state.runs),
-        model: Some(settings.model.clone()),
-        created_at: now_millis(),
-        error: None,
-    };
-    append_chat_history(&[
-        ChatMessage {
-            id: new_message_id(&request.text),
-            role: ChatRole::User,
-            text: request.text.clone(),
-            reasoning: String::new(),
-            tools: Vec::new(),
-            citations: Vec::new(),
-            model: None,
-            created_at: now_millis(),
-            error: None,
-        },
-        message.clone(),
-    ])?;
-    sink.emit(&ChatEvent::Done {
-        turn_id: request.turn_id,
-        message: Box::new(message.clone()),
-        total_tokens: state.total_tokens,
-    });
-    Ok(message)
-}
-
-/// One line per tool run for the UI chips.
-fn tool_detail(call: &CompletedToolCall) -> String {
-    let args = serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or_default();
-    let file = args
-        .get("file")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let project = args
-        .get("project")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let target = file
-        .or(project)
-        .or_else(|| {
-            args.get("query")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    let target = if target.is_empty() {
-        String::new()
-    } else {
-        format!(" {target}")
-    };
-    format!("{}{}", call.name, target)
-}
-
-fn dedup_citations(runs: &[ChatToolRun]) -> Vec<ChatCitation> {
-    let mut seen = HashSet::new();
-    let mut labels = HashSet::new();
-    let mut citations = Vec::new();
-    for run in runs {
-        for citation in &run.sources {
-            let unique = seen.insert((
-                citation.project_path.clone(),
-                citation.file_path.clone(),
-                citation.start_line,
-                citation.end_line,
-                citation.label.clone(),
-            ));
-            // The printed `sources:` block is the label list, so two citations
-            // that name the same location must not both survive.
-            if unique && labels.insert(citation.label.clone()) {
-                citations.push(citation.clone());
-            }
-        }
-    }
-    citations
-}
-
 /// One row per distinct repository: deduplicated by canonical path so a store
 /// holding both spellings of a symlinked directory (`/tmp` vs `/private/tmp`)
 /// yields one entry. The first stored spelling is kept as the identity the
 /// model and the CLI/GUI see.
-fn dedupe_projects(projects: &[String]) -> Vec<String> {
+pub(crate) fn dedupe_projects(projects: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut unique = Vec::with_capacity(projects.len());
     for path in projects {
@@ -875,7 +566,7 @@ fn dedupe_projects(projects: &[String]) -> Vec<String> {
 }
 
 /// The workspace manifest: one compact line per registered project.
-fn build_manifest(projects: &[String]) -> String {
+pub(crate) fn build_manifest(projects: &[String]) -> String {
     let rows: Vec<String> = projects
         .iter()
         .map(|path| {
@@ -928,7 +619,7 @@ pub fn new_message_id(seed: &str) -> String {
     format!("m-{hex}")
 }
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)

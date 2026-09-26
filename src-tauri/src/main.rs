@@ -11,8 +11,9 @@ fn main() {
     }
 
     // macOS Finder passes `-psn_<pid>` on legacy launches; treat it as no
-    // argument at all.
-    if args[1].starts_with("-psn_") {
+    // argument at all. On Windows and Linux a `grove://` link arrives as the
+    // first argument; the GUI (and its single-instance handoff) takes it.
+    if args[1].starts_with("-psn_") || args[1].starts_with("grove://") {
         grove_lib::run();
         return;
     }
@@ -27,9 +28,9 @@ fn main() {
         subcommand => {
             let code = match grove_lib::cli::run(&args[1..]) {
                 Ok(code) => code,
-                Err(failure) => {
-                    eprintln!("grove {}: {}", subcommand, failure.message);
-                    failure.code
+                Err(error) => {
+                    eprintln!("grove {subcommand}: {error}");
+                    error.exit_code()
                 }
             };
             std::process::exit(code);

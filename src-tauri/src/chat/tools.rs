@@ -8,11 +8,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::chat::ChatCitation;
-use crate::commands::path_is_inside_project;
+use crate::config::{path_is_inside_project, registered_path};
 use crate::git::{
     read_blame, read_file_diff, read_file_history, read_project_changes, read_project_status,
-    read_recent_commits, read_worktrees, search_changed_files, DiffView, MAX_BLAME_LINES,
-    MAX_COMMIT_LIMIT,
+    read_recent_commits, read_worktrees, search_changed_files, DiffContext, DiffView,
+    MAX_BLAME_LINES, MAX_COMMIT_LIMIT,
 };
 
 /// The bound for `read_file` payloads; diffs reuse `MAX_TEXT_SIDE_BYTES`.
@@ -186,17 +186,11 @@ fn parse_args(call: &ToolCallRequest) -> Result<ToolArgs, String> {
         .map_err(|error| format!("{}: invalid arguments: {error}", call.name))
 }
 
-/// The diff view the model asked for. An unrecognized value is rejected, not
-/// silently read as `head`.
+/// The diff view the model asked for; absent means `head`. An unrecognized value
+/// is rejected, not silently read as `head`.
 fn parse_view(view: Option<&str>) -> Result<DiffView, String> {
-    match view {
-        None | Some("head") => Ok(DiffView::Head),
-        Some("staged") => Ok(DiffView::Staged),
-        Some("unstaged") => Ok(DiffView::Unstaged),
-        Some(other) => Err(format!(
-            "read_diff: unknown view `{other}` (expected head, staged, or unstaged)"
-        )),
-    }
+    view.map_or(Ok(DiffView::Head), str::parse)
+        .map_err(|error: crate::error::GroveError| format!("read_diff: {error}"))
 }
 
 /// Runs one tool call. Every failure is a readable string, never a panic.
@@ -248,7 +242,7 @@ fn read_diff(context: &ToolContext, args: &ToolArgs) -> Result<ToolOutcome, Stri
     let file = required(&args.file, "file")?;
     let relative = resolve_file(&project, file)?;
     let view = parse_view(args.view.as_deref())?;
-    let diff = read_file_diff(&project, &relative, view, false)?;
+    let diff = read_file_diff(&project, &relative, view, false, DiffContext::Default, None)?;
     let sources = vec![citation(&project, Some(&relative), Some(1), Some(u32::MAX))];
     Ok(ToolOutcome {
         content: bounded_json(serde_json::to_value(&diff).map_err(|error| error.to_string())?)?,
@@ -375,24 +369,14 @@ fn clamp_limit(limit: Option<u32>) -> usize {
 /// descendant on a `/` boundary. Returns the stored project path: the identity
 /// the model was given, even when it differs from the canonical form.
 fn resolve_project(context: &ToolContext, candidate: &str) -> Result<String, String> {
-    let resolved = std::fs::canonicalize(Path::new(candidate))
-        .map_err(|error| format!("{candidate}: {error}"))?;
-    let text = resolved.to_string_lossy().into_owned();
-    context
-        .projects
-        .iter()
-        .find(|project| {
-            path_is_inside_project(project, &text)
-                || std::fs::canonicalize(Path::new(project))
-                    .map(|canonical| path_is_inside_project(&canonical.to_string_lossy(), &text))
-                    .unwrap_or(false)
-        })
-        .cloned()
-        .ok_or_else(|| {
-            format!(
+    registered_path(&context.projects, candidate)
+        .map(|registered| registered.project)
+        .map_err(|error| match error {
+            crate::error::GroveError::OutsideRegisteredProjects { .. } => format!(
                 "{candidate}: not inside a registered project; pass one of the project paths \
                  from list_projects"
-            )
+            ),
+            other => other.to_string(),
         })
 }
 

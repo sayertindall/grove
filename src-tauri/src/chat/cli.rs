@@ -56,8 +56,9 @@ pub fn run_ask(args: &[String]) -> Result<(), String> {
         text,
         context: ChatContext {
             project_path: project,
-            file_path: None,
+            ..ChatContext::default()
         },
+        action: None,
     };
 
     let sink = Arc::new(CliSink { json });
@@ -73,14 +74,38 @@ pub fn run_ask(args: &[String]) -> Result<(), String> {
             "{}",
             serde_json::to_string_pretty(&final_message).map_err(|error| error.to_string())?
         );
-    } else if !final_message.citations.is_empty() {
-        println!();
-        println!("sources:");
-        for citation in &final_message.citations {
-            println!("  - {}", citation.label);
-        }
+    } else {
+        print_sources_and_findings(&final_message);
     }
     Ok(())
+}
+
+/// The `sources:` block, then any findings anchored to a changed hunk.
+fn print_sources_and_findings(message: &crate::chat::ChatMessage) {
+    let sources = message
+        .citations
+        .iter()
+        .map(|citation| format!("  - {}", citation.label));
+    let findings = message.findings.iter().map(|finding| {
+        format!(
+            "  - {:?} {}:{}-{} {}",
+            finding.severity, finding.path, finding.start_line, finding.end_line, finding.title
+        )
+    });
+    for (heading, rows) in [
+        ("sources:", sources.collect::<Vec<_>>()),
+        ("findings:", findings.collect()),
+    ] {
+        if !rows.is_empty() {
+            println!("\n{heading}\n{}", rows.join("\n"));
+        }
+    }
+    if message.dropped_findings > 0 {
+        println!(
+            "({} finding(s) could not be tied to a hunk)",
+            message.dropped_findings
+        );
+    }
 }
 
 /// Prints streamed text as it arrives; reasoning goes to stderr so stdout stays
@@ -104,7 +129,7 @@ impl ChatSink for CliSink {
                     let _ = std::io::stderr().flush();
                 }
             }
-            ChatEvent::Tool { .. } => {}
+            ChatEvent::Tool { .. } | ChatEvent::Egress { .. } => {}
             ChatEvent::Done { .. } => {
                 if !self.json {
                     println!();

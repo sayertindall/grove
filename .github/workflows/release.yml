@@ -1,7 +1,18 @@
 name: release
 
-# Push a tag (or start a run from the Actions tab) and GitHub builds both macOS
-# bundles, runs the Rust tests, and publishes the release with the artifacts on it.
+# Push a tag (or start a run from the Actions tab) and GitHub builds one universal
+# macOS bundle, runs the Rust tests, signs and notarizes it when the Apple secrets
+# are configured, signs the updater archive, and publishes the release with
+# `latest.json`, which the in-app updater reads.
+#
+# Repository configuration:
+#   variables  TAURI_SIGNING_PUBLIC_KEY            public half of `pnpm tauri signer generate`
+#   secrets    TAURI_SIGNING_PRIVATE_KEY           private half (never committed)
+#              TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password
+#   optional   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+#              APPLE_SIGNING_IDENTITY, APPLE_API_ISSUER, APPLE_API_KEY,
+#              APPLE_API_KEY_P8 (contents of AuthKey_<id>.p8; written to
+#              APPLE_API_KEY_PATH for notarytool)
 on:
  workflow_dispatch:
   inputs:
@@ -18,19 +29,17 @@ concurrency:
  cancel-in-progress: false
 
 jobs:
+ # A tag only builds after the same checks a pull request must pass.
+ verify:
+  name: verify
+  uses: ./.github/workflows/verify.yml
+
  build-macos:
-  name: grove ${{ matrix.target }}
+  name: grove universal-apple-darwin
+  needs: verify
   runs-on: macos-latest
   permissions:
    contents: write
-  strategy:
-   fail-fast: false
-   matrix:
-    include:
-     - target: aarch64-apple-darwin
-       suffix: aarch64
-     - target: x86_64-apple-darwin
-       suffix: x64
   steps:
    - uses: actions/checkout@v7
 
@@ -46,7 +55,7 @@ jobs:
    - name: install Rust
      uses: dtolnay/rust-toolchain@stable
      with:
-      targets: ${{ matrix.target }}
+      targets: aarch64-apple-darwin,x86_64-apple-darwin
 
    - name: Rust cache
      uses: Swatinem/rust-cache@v2
@@ -69,10 +78,48 @@ jobs:
       echo "version=$version" >> "$GITHUB_OUTPUT"
       echo "tag=app-v$version" >> "$GITHUB_OUTPUT"
 
-   - name: build the bundles and publish the release
+   # The updater refuses unsigned archives, so a release without the key pair
+   # fails here rather than shipping an update nobody can install. The public key
+   # goes into a config overlay (`tauri build --config`) and, through the job
+   # environment, into the binary. Apple signing is exported only when its secrets
+   # exist: an empty APPLE_CERTIFICATE would make the bundler try to import it.
+   - name: prepare signing
+     env:
+      TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+     run: |
+      if [ -z "$TAURI_SIGNING_PUBLIC_KEY" ] || [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+        echo "::error::set the TAURI_SIGNING_PUBLIC_KEY variable and TAURI_SIGNING_PRIVATE_KEY secret (pnpm tauri signer generate)"
+        exit 1
+      fi
+      echo "TAURI_SIGNING_PUBLIC_KEY=$TAURI_SIGNING_PUBLIC_KEY" >> "$GITHUB_ENV"
+      node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({plugins: {updater: {pubkey: process.env.TAURI_SIGNING_PUBLIC_KEY}}}))' \
+        "$RUNNER_TEMP/tauri.release.conf.json"
+      if [ -n "$APPLE_CERTIFICATE" ]; then
+        for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+          echo "$name=${!name}" >> "$GITHUB_ENV"
+        done
+      fi
+      if [ -n "$APPLE_API_KEY_P8" ]; then
+        key_path="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY.p8"
+        printf '%s' "$APPLE_API_KEY_P8" > "$key_path"
+        echo "APPLE_API_ISSUER=$APPLE_API_ISSUER" >> "$GITHUB_ENV"
+        echo "APPLE_API_KEY=$APPLE_API_KEY" >> "$GITHUB_ENV"
+        echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+      fi
+
+   - name: build the bundle and publish the release
      uses: tauri-apps/tauri-action@v1
      env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
      with:
       tagName: ${{ steps.app.outputs.tag }}
       releaseName: "Grove v__VERSION__"
@@ -94,10 +141,11 @@ jobs:
        key. A remote host needs an explicit acknowledgement before the first turn, and
        nothing is transmitted until you send a message. Keys go to the macOS Keychain.
 
-       ### The CLI
+       ### The CLI and MCP server
 
        The app binary is also a read-only CLI, so scripts and agents see exactly what the
-       window shows:
+       window shows, and `grove mcp` serves the assistant's nine tools to Claude Code or
+       any MCP client over stdio:
 
        ```bash
        grove status [--json]
@@ -105,60 +153,48 @@ jobs:
        grove diff <project> <file> [--view head|staged|unstaged] [--json]
        grove worktrees [<project>] [--json]
        grove ask "what changed here?" [--project <path>]
+       claude mcp add grove -- /Applications/Grove.app/Contents/MacOS/grove mcp
        ```
 
        ### Install
 
-       1. Download `Grove___VERSION___aarch64.dmg` (Apple silicon) or
-          `Grove___VERSION___x64.dmg` (Intel) and open it.
+       1. Download `Grove___VERSION___universal.dmg` (Apple silicon and Intel) and open it.
        2. Drag **Grove** to Applications.
 
-       The bundles are unsigned, so the first launch of a downloaded copy is
-       quarantined by Gatekeeper. Right-click the app and choose **Open** once, or:
+       Later versions install from **Grove → Check for Updates…**; the update is
+       verified against the signing key before it is applied.
 
-       ```bash
-       xattr -dr com.apple.quarantine /Applications/Grove.app
-       ```
-
-       `Grove___VERSION___*.app.zip` is the same bundle zipped, if you would rather
-       not mount a disk image.
+       `Grove___VERSION___universal.app.zip` is the same bundle zipped, if you would
+       rather not mount a disk image.
       releaseDraft: ${{ inputs.draft || false }}
       prerelease: false
-      args: --target ${{ matrix.target }}
+      includeUpdaterJson: true
+      args: --target universal-apple-darwin --config ${{ runner.temp }}/tauri.release.conf.json
 
-   # tauri-action attaches what the bundler produced. The zipped app and the
-   # screenshot are added here so the release matches what a local build ships.
-   - name: attach the zipped app and the screenshot
+   # tauri-action attaches the .dmg, the signed updater archive (.app.tar.gz + .sig),
+   # and latest.json. The zipped app and the screenshot are added here so the
+   # release matches what a local build ships.
+   - name: attach the zipped app
      env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
      run: |
-      app="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Grove.app"
-      zip="/tmp/Grove_${{ steps.app.outputs.version }}_${{ matrix.suffix }}.app.zip"
+      app="src-tauri/target/universal-apple-darwin/release/bundle/macos/Grove.app"
+      zip="/tmp/Grove_${{ steps.app.outputs.version }}_universal.app.zip"
       ditto -c -k --keepParent "$app" "$zip"
       gh release upload "${{ steps.app.outputs.tag }}" "$zip" --clobber
 
    - name: attach the screenshot
-     if: matrix.suffix == 'aarch64'
      env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
      run: gh release upload "${{ steps.app.outputs.tag }}" docs/grove-screenshot.png --clobber
 
-   # tauri-action also attaches the bundle as .app.tar.gz for Tauri's updater, which
-   # Grove does not configure. The .zip above is the macOS-idiomatic twin of the same
-   # bytes, so the archives go, leaving one bundle per architecture on the release.
-   - name: drop the unused updater archives
-     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-     run: |
-      base="Grove_${{ steps.app.outputs.version }}_${{ matrix.suffix }}.app.tar.gz"
-      gh release delete-asset "${{ steps.app.outputs.tag }}" "$base" --yes || true
-      gh release delete-asset "${{ steps.app.outputs.tag }}" "$base.sig" --yes || true
-
-   - name: upload the bundles as run artifacts
+   - name: upload the bundle as run artifacts
      uses: actions/upload-artifact@v7
      with:
-      name: grove-${{ matrix.target }}
+      name: grove-universal-apple-darwin
       path: |
-       src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-       src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+       src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+       src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+       src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+       src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
       if-no-files-found: error
