@@ -246,8 +246,8 @@ pub async fn chat_clear() -> Result<(), String> {
 
 /// Starts one turn; results arrive as `grove://chat-*` events on the turn id.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn chat_send(
-    app: AppHandle,
+pub async fn chat_send<R: tauri::Runtime>(
+    app: AppHandle<R>,
     request: crate::chat::ChatSendRequest,
 ) -> Result<(), String> {
     let settings = crate::chat::load_chat_settings()?;
@@ -266,11 +266,11 @@ pub async fn chat_cancel(turn_id: String) -> Result<(), String> {
 
 /// Emits the turn's events on the `grove://chat-*` channels the frontend
 /// subscribes to once for the app's lifetime.
-struct EventSink {
-    app: AppHandle,
+struct EventSink<R: tauri::Runtime> {
+    app: AppHandle<R>,
 }
 
-impl crate::chat::ChatSink for EventSink {
+impl<R: tauri::Runtime> crate::chat::ChatSink for EventSink<R> {
     fn emit(&self, event: &crate::chat::ChatEvent) {
         use crate::chat::ChatEvent;
 

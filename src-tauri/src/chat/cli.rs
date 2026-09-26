@@ -61,8 +61,12 @@ pub fn run_ask(args: &[String]) -> Result<(), String> {
     };
 
     let sink = Arc::new(CliSink { json });
-    let final_message =
-        tauri::async_runtime::block_on(send_turn_with_projects(sink, settings, Some(projects), request))?;
+    let final_message = tauri::async_runtime::block_on(send_turn_with_projects(
+        sink,
+        settings,
+        Some(projects),
+        request,
+    ))?;
 
     if json {
         println!(
@@ -88,13 +92,13 @@ struct CliSink {
 impl ChatSink for CliSink {
     fn emit(&self, event: &ChatEvent) {
         match event {
-            ChatEvent::Delta { text } => {
+            ChatEvent::Delta { text, .. } => {
                 if !self.json {
                     print!("{text}");
                     let _ = std::io::stdout().flush();
                 }
             }
-            ChatEvent::Reasoning { text } => {
+            ChatEvent::Reasoning { text, .. } => {
                 if !self.json {
                     eprint!("{text}");
                     let _ = std::io::stderr().flush();

@@ -17,10 +17,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chat::provider::{
-    stream_turn, CompletedToolCall, ProviderKind, ToolSpec, TurnMessage,
-};
 use crate::chat::prompt::system_prompt;
+use crate::chat::provider::{stream_turn, CompletedToolCall, ProviderKind, ToolSpec, TurnMessage};
 use crate::chat::tools::{run_tool, tool_specs, ToolCallRequest, ToolContext};
 use crate::git::read_project_status;
 
@@ -154,14 +152,34 @@ pub struct ChatSendRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum ChatEvent {
-    Delta { text: String },
-    Reasoning { text: String },
-    Tool { tool: ChatToolRun },
+    Delta {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        text: String,
+    },
+    Reasoning {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        text: String,
+    },
+    Tool {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        tool: ChatToolRun,
+    },
     Done {
+        #[serde(rename = "turnId")]
+        turn_id: String,
         message: Box<ChatMessage>,
+        #[serde(rename = "totalTokens")]
         total_tokens: Option<u64>,
     },
-    Error { message: String, retryable: bool },
+    Error {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        message: String,
+        retryable: bool,
+    },
 }
 
 /// Receives streamed events for one turn.
@@ -198,7 +216,8 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> 
 
 fn write_json(path: &std::path::Path, value: &impl Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
     let mut file = std::fs::OpenOptions::new()
@@ -241,9 +260,7 @@ struct HistoryFile {
 /// Loads the persisted history, oldest first.
 pub fn load_chat_history() -> Result<Vec<ChatMessage>, String> {
     let path = data_dir()?.join(HISTORY_FILE);
-    Ok(read_json::<HistoryFile>(&path)
-        .unwrap_or_default()
-        .messages)
+    Ok(read_json::<HistoryFile>(&path).unwrap_or_default().messages)
 }
 
 /// Appends messages and keeps the newest `HISTORY_LIMIT`.
@@ -276,12 +293,8 @@ pub fn load_registered_projects() -> Result<Vec<String>, String> {
     fn missing_key() -> Option<Vec<String>> {
         None
     }
-    let store: Store = read_json(&path).ok_or_else(|| {
-        format!(
-            "{}: not a readable projects store",
-            path.display()
-        )
-    })?;
+    let store: Store = read_json(&path)
+        .ok_or_else(|| format!("{}: not a readable projects store", path.display()))?;
     Ok(store.projects.unwrap_or_default())
 }
 
@@ -396,7 +409,10 @@ pub fn cancel_turn(turn_id: &str) {
 /// Refuses a turn when cloud egress is not allowed and the provider is remote.
 pub fn ensure_egress_allowed(settings: &ChatSettings) -> Result<(), String> {
     let host = host_of(&settings.base_url);
-    let local = matches!(host.as_deref(), Some("127.0.0.1") | Some("localhost") | Some("::1"));
+    let local = matches!(
+        host.as_deref(),
+        Some("127.0.0.1") | Some("localhost") | Some("::1")
+    );
     if !local && !settings.allow_cloud_egress {
         return Err(format!(
             "cloud egress is off; allow it in chat settings before using {}",
@@ -433,22 +449,34 @@ pub async fn send_turn_with_projects(
     request: ChatSendRequest,
 ) -> Result<ChatMessage, String> {
     let turn_id = request.turn_id.clone();
+    let result = run_turn(Arc::clone(&sink), settings, projects_override, request).await;
+    if let Err(error) = &result {
+        sink.emit(&ChatEvent::Error {
+            turn_id,
+            message: error.clone(),
+            retryable: false,
+        });
+    }
+    result
+}
+
+/// The loop itself: streams the model, runs the tools it asks for, persists the
+/// pair, and reports the final message. Every failure leaves as `Err`, so the
+/// caller reports it on the turn's error channel instead of leaving the panel
+/// waiting for an answer that will never come.
+async fn run_turn(
+    sink: Arc<dyn ChatSink>,
+    settings: ChatSettings,
+    projects_override: Option<Vec<String>>,
+    request: ChatSendRequest,
+) -> Result<ChatMessage, String> {
+    let turn_id = request.turn_id.clone();
     let cancel = register_turn(&turn_id);
 
-    let fail = |message: String, retryable: bool| {
-        sink.emit(&ChatEvent::Error {
-            message: message.clone(),
-            retryable,
-        });
-        Err::<ChatMessage, _>(message)
-    };
-
     if request.text.trim().is_empty() {
-        return fail("the message was empty".to_string(), false);
+        return Err("the message was empty".to_string());
     }
-    if let Err(error) = ensure_egress_allowed(&settings) {
-        return fail(error, false);
-    }
+    ensure_egress_allowed(&settings)?;
     let stored = match projects_override {
         Some(projects) => projects,
         None => load_registered_projects()?,
@@ -456,7 +484,7 @@ pub async fn send_turn_with_projects(
     let projects = dedupe_projects(&stored);
     let api_key = match resolve_api_key(settings.provider, &settings.base_url) {
         Ok(key) => key,
-        Err(error) => return fail(error, false),
+        Err(error) => return Err(error),
     };
 
     let manifest = build_manifest(&projects);
@@ -497,12 +525,13 @@ pub async fn send_turn_with_projects(
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         if cancel.load(Ordering::Relaxed) {
-            return fail("cancelled".to_string(), false);
+            return Err("cancelled".to_string());
         }
 
         let outcome = {
             let sink = Arc::clone(&sink);
             let cancel_flag = Arc::clone(&cancel);
+            let turn_key = turn_id.clone();
             stream_turn(
                 settings.provider.into(),
                 &settings.base_url,
@@ -514,11 +543,15 @@ pub async fn send_turn_with_projects(
                 &specs,
                 &cancel_flag,
                 &move |event| match event {
-                    provider::ProviderEvent::TextDelta(delta) => {
-                        sink.emit(&ChatEvent::Delta { text: delta })
-                    }
+                    provider::ProviderEvent::TextDelta(delta) => sink.emit(&ChatEvent::Delta {
+                        turn_id: turn_key.clone(),
+                        text: delta,
+                    }),
                     provider::ProviderEvent::ReasoningDelta(delta) => {
-                        sink.emit(&ChatEvent::Reasoning { text: delta })
+                        sink.emit(&ChatEvent::Reasoning {
+                            turn_id: turn_key.clone(),
+                            text: delta,
+                        })
                     }
                     provider::ProviderEvent::ToolCall { .. }
                     | provider::ProviderEvent::Done { .. }
@@ -549,6 +582,7 @@ pub async fn send_turn_with_projects(
         for call in outcome.calls {
             let detail = tool_detail(&call);
             sink.emit(&ChatEvent::Tool {
+                turn_id: turn_id.clone(),
                 tool: ChatToolRun {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -559,7 +593,7 @@ pub async fn send_turn_with_projects(
             });
 
             if cancel.load(Ordering::Relaxed) {
-                return fail("cancelled".to_string(), false);
+                return Err("cancelled".to_string());
             }
 
             let request = ToolCallRequest {
@@ -571,15 +605,16 @@ pub async fn send_turn_with_projects(
             let executed = crate::commands::blocking(move || run_tool(&context, &request)).await;
 
             let (content, sources, status) = match executed {
-                Ok(outcome) => (
-                    outcome.content,
-                    outcome.sources,
-                    ChatToolStatus::Ok,
+                Ok(outcome) => (outcome.content, outcome.sources, ChatToolStatus::Ok),
+                Err(error) => (
+                    format!("{{\"error\": {}}}", error),
+                    Vec::new(),
+                    ChatToolStatus::Error,
                 ),
-                Err(error) => (format!("{{\"error\": {}}}", error), Vec::new(), ChatToolStatus::Error),
             };
 
             sink.emit(&ChatEvent::Tool {
+                turn_id: turn_id.clone(),
                 tool: ChatToolRun {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -633,6 +668,7 @@ pub async fn send_turn_with_projects(
     ])?;
 
     sink.emit(&ChatEvent::Done {
+        turn_id,
         message: Box::new(message.clone()),
         total_tokens,
     });
@@ -652,7 +688,11 @@ fn tool_detail(call: &CompletedToolCall) -> String {
         .map(str::to_string);
     let target = file
         .or(project)
-        .or_else(|| args.get("query").and_then(serde_json::Value::as_str).map(str::to_string))
+        .or_else(|| {
+            args.get("query")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or_default();
     let target = if target.is_empty() {
         String::new()
@@ -750,7 +790,10 @@ pub fn new_message_id(seed: &str) -> String {
     hasher.update(seed.as_bytes());
     hasher.update(now_millis().to_le_bytes());
     let digest = hasher.finalize();
-    let hex: String = digest[..4].iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex: String = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     format!("m-{hex}")
 }
 

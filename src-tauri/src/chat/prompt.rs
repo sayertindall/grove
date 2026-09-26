@@ -28,17 +28,15 @@ read-only; propose changes as suggestions the user would apply themselves.
 /// The per-turn ambient context: what the user is looking at right now.
 fn ambient_line(context: &ChatContext) -> String {
     match (&context.project_path, &context.file_path) {
-        (Some(project), Some(file)) => format!(
-            "The user is currently looking at `{file}` in the project `{project}`."
-        ),
+        (Some(project), Some(file)) => {
+            format!("The user is currently looking at `{file}` in the project `{project}`.")
+        }
         (Some(project), None) => {
             format!("The user is currently looking at the project `{project}`.")
         }
         (None, Some(file)) => {
             format!("The user is currently looking at the file `{file}`.")
         }
-        (None, None) => {
-            "The user has no specific project or file open right now.".to_string()
-        }
+        (None, None) => "The user has no specific project or file open right now.".to_string(),
     }
 }

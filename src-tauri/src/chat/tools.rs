@@ -117,12 +117,8 @@ pub fn tool_specs() -> Vec<(String, String, Value)> {
         ),
         (
             "list_worktrees".into(),
-            "List the git worktrees of one project, including the main worktree."
-                .into(),
-            schema(
-                json!({"project": {"type": "string"}}),
-                &["project"],
-            ),
+            "List the git worktrees of one project, including the main worktree.".into(),
+            schema(json!({"project": {"type": "string"}}), &["project"]),
         ),
         (
             "recent_commits".into(),
@@ -138,8 +134,7 @@ pub fn tool_specs() -> Vec<(String, String, Value)> {
         ),
         (
             "file_history".into(),
-            "List the commits that touched one file, newest first (default 20, max 50)."
-                .into(),
+            "List the commits that touched one file, newest first (default 20, max 50).".into(),
             schema(
                 json!({
                     "project": {"type": "string"},
@@ -226,12 +221,7 @@ pub fn run_tool(context: &ToolContext, call: &ToolCallRequest) -> Result<ToolOut
                 _ => DiffView::Head,
             };
             let diff = read_file_diff(&project, &relative, view, false)?;
-            let sources = vec![citation(
-                &project,
-                Some(&relative),
-                Some(1),
-                Some(u32::MAX),
-            )];
+            let sources = vec![citation(&project, Some(&relative), Some(1), Some(u32::MAX))];
             Ok(ToolOutcome {
                 content: bounded_json(
                     serde_json::to_value(&diff).map_err(|error| error.to_string())?,
@@ -244,8 +234,8 @@ pub fn run_tool(context: &ToolContext, call: &ToolCallRequest) -> Result<ToolOut
             let file = required(&args.file, "file")?;
             let relative = resolve_file(&project, file)?;
             let full = Path::new(&project).join(&relative);
-            let metadata = std::fs::metadata(&full)
-                .map_err(|error| format!("{relative}: {error}"))?;
+            let metadata =
+                std::fs::metadata(&full).map_err(|error| format!("{relative}: {error}"))?;
             if !metadata.is_file() {
                 return Err(format!("{relative}: not a file"));
             }
@@ -272,7 +262,8 @@ pub fn run_tool(context: &ToolContext, call: &ToolCallRequest) -> Result<ToolOut
                 if matches.len() >= MAX_SEARCH_MATCHES {
                     break;
                 }
-                let found = search_changed_files(project, query, MAX_SEARCH_MATCHES - matches.len())?;
+                let found =
+                    search_changed_files(project, query, MAX_SEARCH_MATCHES - matches.len())?;
                 for hit in found {
                     sources.push(citation(
                         project,
@@ -321,7 +312,9 @@ pub fn run_tool(context: &ToolContext, call: &ToolCallRequest) -> Result<ToolOut
             let file = required(&args.file, "file")?;
             let relative = resolve_file(&project, file)?;
             let blame = read_blame(&project, &relative, args.start_line, args.end_line)?;
-            let start = args.start_line.or_else(|| blame.first().map(|row| row.line));
+            let start = args
+                .start_line
+                .or_else(|| blame.first().map(|row| row.line));
             let end = args
                 .end_line
                 .or_else(|| blame.last().map(|row| row.line))
@@ -386,7 +379,8 @@ fn resolve_file(project: &str, file: &str) -> Result<String, String> {
     let project_root = Path::new(project);
     // Compare against the canonical root so a stored path through a symlink
     // (`/tmp/...` on macOS) still matches canonicalized candidates.
-    let canonical_root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let root_text = canonical_root.to_string_lossy().into_owned();
     let candidate = Path::new(file);
     let relative: std::borrow::Cow<'_, str> = if candidate.is_absolute() {
@@ -403,8 +397,7 @@ fn resolve_file(project: &str, file: &str) -> Result<String, String> {
     };
 
     let joined = project_root.join(relative.as_ref());
-    let canonical = std::fs::canonicalize(&joined)
-        .map_err(|error| format!("{file}: {error}"))?;
+    let canonical = std::fs::canonicalize(&joined).map_err(|error| format!("{file}: {error}"))?;
     if !path_is_inside_project(&root_text, canonical.to_string_lossy().as_ref()) {
         return Err(format!("{file}: not inside {project}"));
     }
@@ -419,7 +412,8 @@ fn resolve_file(project: &str, file: &str) -> Result<String, String> {
 fn read_bounded(path: &Path) -> Result<(String, bool), String> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let cap = MAX_READ_FILE_BYTES as usize;
     let mut buffer = vec![0u8; cap + 1];
     let mut read = 0usize;
@@ -443,8 +437,7 @@ fn read_bounded(path: &Path) -> Result<(String, bool), String> {
 /// Serializes and enforces the payload bound: anything past 512 KiB is dropped to a
 /// marker the model can read.
 fn bounded_json(value: Value) -> Result<String, String> {
-    let mut text =
-        serde_json::to_string(&value).map_err(|error| error.to_string())?;
+    let mut text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
     if text.len() > crate::git::MAX_TEXT_SIDE_BYTES as usize {
         text = format!(
             "{{\"truncated\": true, \"note\": \"payload exceeded {} bytes and was cut\"}}",
@@ -476,4 +469,3 @@ fn citation(
         label,
     }
 }
-

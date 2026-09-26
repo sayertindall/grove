@@ -178,11 +178,8 @@ export interface ChatToolEvent {
 
 export interface ChatDoneEvent {
   turnId: string;
-  messageId: string;
-  text: string;
-  reasoning: string;
-  citations: ChatCitation[];
-  model: string | null;
+  /** The answer as it was persisted, carrying its own id, citations and model. */
+  message: ChatMessage;
   /** Total tokens when the provider reported them. */
   totalTokens: number | null;
 }

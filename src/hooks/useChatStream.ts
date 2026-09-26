@@ -109,15 +109,9 @@ export function useChatStream() {
     }).then(track);
 
     void listenForChatDone((event) => {
-      patchAssistant(event.turnId, (message) => ({
-        ...message,
-        id: event.messageId,
-        text: event.text,
-        reasoning: event.reasoning,
-        citations: event.citations,
-        model: event.model,
-        error: null,
-      }));
+      // The backend persists the answer before announcing it, so the event's
+      // message is the final word: its id, text, citations and model.
+      patchAssistant(event.turnId, () => ({ ...event.message }));
       setActiveTurnId((current) => (current === event.turnId ? null : current));
     }).then(track);
 

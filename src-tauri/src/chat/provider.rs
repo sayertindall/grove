@@ -233,10 +233,7 @@ impl Adapter for OpenAiAdapter {
                 on(ProviderEvent::ReasoningDelta(reasoning.to_string()));
             }
             for call in &choice.delta.tool_calls {
-                let pending = self
-                    .pending
-                    .entry(call.index)
-                    .or_default();
+                let pending = self.pending.entry(call.index).or_default();
                 if let Some(id) = &call.id {
                     pending.id = id.clone();
                 }
@@ -571,11 +568,7 @@ fn anthropic_request(
         "stream": true,
     });
     if !system.is_empty() {
-        body["system"] = json!(system
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n\n"));
+        body["system"] = json!(system.into_iter().cloned().collect::<Vec<_>>().join("\n\n"));
     }
     if let Some(temperature) = temperature {
         body["temperature"] = json!(temperature);
