@@ -528,7 +528,18 @@ export default function App() {
     "view.theme-dark": () => dispatch({ type: "set-theme", value: "dark" }),
     "view.toggle-chat": toggleChat,
     "view.toggle-sidebar": () => dispatch({ type: "toggle-sidebar" }),
-    "view.toggle-history": () => dispatch({ type: "setHistoryOpen", open: !historyOpen }),
+    "view.toggle-history": () => {
+      // The history panel lives in the single-file viewer. From the stream, open the
+      // focused file there with history showing; elsewhere just toggle the panel.
+      if (layoutMode === "stream") {
+        if (focus.projectPath === null || focus.file === null) return;
+        dispatch({ type: "set-layout-mode", value: "file" });
+        openProjectFile(focus.projectPath, focus.file.path, "file");
+        dispatch({ type: "set-history-open", open: true });
+        return;
+      }
+      dispatch({ type: "set-history-open", open: !historyOpen });
+    },
     "view.reload": () => invalidateEverything(queryClient),
     "navigate.command-palette": () => setPaletteScope("files"),
     "navigate.go-to-project": () => setPaletteScope("repos"),
@@ -602,8 +613,8 @@ export default function App() {
       dispatch({ type: "set-line-diff-type", value }),
     onDiffContextChange: (value: typeof diffContext) =>
       dispatch({ type: "set-diff-context", value }),
-    onImageModeChange: (mode: typeof imageMode) => dispatch({ type: "setImageMode", mode }),
-    onHistoryOpenChange: (open: boolean) => dispatch({ type: "setHistoryOpen", open }),
+    onImageModeChange: (mode: typeof imageMode) => dispatch({ type: "set-image-mode", mode }),
+    onHistoryOpenChange: (open: boolean) => dispatch({ type: "set-history-open", open }),
   };
   const askAboutLines =
     (projectPath: string, filePath: string) => (selection: { start: number; end: number }) => {

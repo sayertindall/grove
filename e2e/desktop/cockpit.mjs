@@ -525,6 +525,30 @@ await waitFor(() => !document.querySelector('[data-testid="history-panel"]'), "h
 return true;`),
         );
         check(checks, "⌘Y closes it", true, o.closed);
+        // From the stream, ⌘Y opens the focused file in the File layout with history showing.
+        const fromStream = await ctx.bridge.eval(
+          page(`
+await setLayout("Stream");
+const row = await findStreamFile(${J(projects.dirty)}, "unstaged.txt");
+row.click();
+await sleep(200);
+press("y", { metaKey: true, code: "KeyY" });
+const panel = await waitFor(() => document.querySelector('[data-testid="history-panel"]'), "history panel from stream");
+const fileLayout = buttonNamed("File", group("Layout"))?.getAttribute("aria-pressed") === "true";
+const label = panel.getAttribute("aria-label");
+await sleep(300);
+press("y", { metaKey: true, code: "KeyY" });
+await waitFor(() => !document.querySelector('[data-testid="history-panel"]'), "history closed again");
+return { fileLayout, label };`),
+        );
+        await ctx.shot("history-panel-from-stream");
+        check(checks, "stream ⌘Y switches to the File layout", true, fromStream.fileLayout);
+        check(
+          checks,
+          "stream ⌘Y shows that file's history",
+          "History of unstaged.txt",
+          fromStream.label,
+        );
         check(checks, "panel label", "History of unstaged.txt", o.label);
         check(
           checks,

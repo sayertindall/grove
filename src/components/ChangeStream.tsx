@@ -273,7 +273,15 @@ export function ChangeStream({
           </EmptyHeader>
         </Empty>
       ) : (
-        <div className="relative min-h-0 flex-1">
+        <div
+          className="relative min-h-0 flex-1"
+          onClickCapture={(event) => {
+            const root = containerRef.current;
+            if (root === null) return;
+            const pressed = pressedFileRow(root, event.target, event.clientY);
+            if (pressed !== null) setActiveFileId(pressed);
+          }}
+        >
           <CodeView
             ref={viewRef}
             containerRef={containerRef}
@@ -475,6 +483,27 @@ function readTopRows(root: HTMLElement): { project: string | null; fileId: strin
     }
   }
   return { project, fileId };
+}
+
+/**
+ * The file a click lands on: its header when the click is on one (keyboard activation
+ * has no geometry), otherwise the last file header above the pointer.
+ */
+function pressedFileRow(root: HTMLElement, target: EventTarget, clientY: number): string | null {
+  if (target instanceof Element) {
+    const header = target.closest<HTMLElement>('[data-stream-row="file"]');
+    if (header !== null) return header.dataset.id ?? null;
+  }
+  let fileId: string | null = null;
+  let headerTop = -Infinity;
+  for (const header of root.querySelectorAll<HTMLElement>('[data-stream-row="file"]')) {
+    const top = header.getBoundingClientRect().top;
+    if (top <= clientY && top > headerTop) {
+      headerTop = top;
+      fileId = header.dataset.id ?? null;
+    }
+  }
+  return fileId;
 }
 
 /**

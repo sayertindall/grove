@@ -88,8 +88,8 @@ export type ViewerAction =
   | { type: "toggle-sidebar" }
   | { type: "set-line-diff-type"; value: LineDiffType }
   | { type: "set-diff-context"; value: DiffContextChoice }
-  | { type: "setImageMode"; mode: ImageMode }
-  | { type: "setHistoryOpen"; open: boolean };
+  | { type: "set-image-mode"; mode: ImageMode }
+  | { type: "set-history-open"; open: boolean };
 
 function initViewerState(): ViewerState {
   return {
@@ -206,9 +206,9 @@ function reducer(state: ViewerState, action: ViewerAction): ViewerState {
       return { ...state, lineDiffType: action.value };
     case "set-diff-context":
       return { ...state, diffContext: action.value };
-    case "setImageMode":
+    case "set-image-mode":
       return { ...state, imageMode: action.mode };
-    case "setHistoryOpen":
+    case "set-history-open":
       return { ...state, historyOpen: action.open };
   }
 }
