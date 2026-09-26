@@ -13,6 +13,9 @@ import {
 } from "@/api/chat";
 import type { ChatContext, ChatMessage } from "@/types/grove";
 
+/** Coalescing window for streamed text, in milliseconds. */
+const STREAM_FLUSH_MS = 50;
+
 /** A fresh user message: tool runs and citations only ever appear on answers. */
 function userMessage(turnId: string, text: string): ChatMessage {
   return {
@@ -85,6 +88,49 @@ export function useChatStream() {
     localTurnIdsRef.current.delete(turnId);
   }, []);
 
+  /**
+   * Streamed text is coalesced before it reaches state: one answer costs a few
+   * renders instead of one per token, which matters because every render re-parses
+   * the whole markdown answer.
+   */
+  const pendingRef = useRef<{ turnId: string; text: string; reasoning: string } | null>(null);
+  const flushTimerRef = useRef<number | undefined>(undefined);
+
+  const flushPending = useCallback(() => {
+    window.clearTimeout(flushTimerRef.current);
+    flushTimerRef.current = undefined;
+    const pending = pendingRef.current;
+    if (pending === null) return;
+    pendingRef.current = null;
+    patchAssistant(pending.turnId, (message) => ({
+      ...message,
+      text: message.text + pending.text,
+      reasoning: message.reasoning + pending.reasoning,
+    }));
+  }, [patchAssistant]);
+
+  const queueStream = useCallback(
+    (turnId: string, text: string, reasoning: string) => {
+      const pending = pendingRef.current;
+      if (pending === null || pending.turnId !== turnId) {
+        flushPending();
+        pendingRef.current = { turnId, text, reasoning };
+      } else {
+        pending.text += text;
+        pending.reasoning += reasoning;
+      }
+      if (flushTimerRef.current === undefined) {
+        flushTimerRef.current = window.setTimeout(() => {
+          flushTimerRef.current = undefined;
+          flushPending();
+        }, STREAM_FLUSH_MS);
+      }
+    },
+    [flushPending],
+  );
+
+  useEffect(() => () => window.clearTimeout(flushTimerRef.current), []);
+
   useEffect(() => {
     let cancelled = false;
     const stops: (() => void)[] = [];
@@ -120,14 +166,11 @@ export function useChatStream() {
       });
 
     void listenForChatDelta((event) => {
-      patchAssistant(event.turnId, (message) => ({ ...message, text: message.text + event.text }));
+      queueStream(event.turnId, event.text, "");
     }).then(track);
 
     void listenForChatReasoning((event) => {
-      patchAssistant(event.turnId, (message) => ({
-        ...message,
-        reasoning: message.reasoning + event.text,
-      }));
+      queueStream(event.turnId, "", event.text);
     }).then(track);
 
     void listenForChatTool((event) => {
@@ -145,6 +188,7 @@ export function useChatStream() {
       // message is the final word: its id, text, citations and model. It replaces
       // the placeholder in place; if the placeholder is gone the persisted
       // message is appended so the answer still lands in the transcript.
+      flushPending();
       patchAssistant(
         event.turnId,
         () => ({ ...event.message }),
@@ -160,6 +204,7 @@ export function useChatStream() {
     }).then(track);
 
     void listenForChatError((event) => {
+      flushPending();
       patchAssistant(
         event.turnId,
         (message) => ({ ...message, error: event.message }),
@@ -175,7 +220,7 @@ export function useChatStream() {
       cancelled = true;
       for (const stop of stops) stop();
     };
-  }, [patchAssistant, settleTurn]);
+  }, [patchAssistant, settleTurn, queueStream, flushPending]);
 
   const startTurn = useCallback(
     (turnId: string, text: string, context: ChatContext) => {
