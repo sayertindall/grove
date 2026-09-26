@@ -28,7 +28,9 @@ pub fn directory_holds_git_metadata(directory: &Path) -> bool {
 }
 
 fn is_skipped_directory_name(name: &std::ffi::OsStr) -> bool {
-    SKIPPED_DIRECTORY_NAMES.iter().any(|skipped| name == *skipped)
+    SKIPPED_DIRECTORY_NAMES
+        .iter()
+        .any(|skipped| name == *skipped)
 }
 
 /// Returns the canonical absolute paths of every directory at or below `root`
